@@ -178,3 +178,25 @@ def test_run_intraday_backtest_end_to_end():
     assert res.days == 4 and len(res.trades) == 2 and res.watched == 2
     assert res.profit_factor is not None and "win rate" in res.summary()
     assert res.total_pnl == pytest.approx(sum(res.daily_pnl.values()))
+
+
+def test_simulate_day_with_utc_timestamps_like_alpaca():
+    """Alpaca returns bar times in UTC; the entry window must still be measured in Eastern time."""
+    from datetime import timezone
+
+    c = cfg()
+    adv = 50_000 * 390 / 3
+    utc_bars = [MinuteBar(b.t.astimezone(timezone.utc), b.o, b.h, b.l, b.c, b.v) for b in session(after="rally")]
+    trades, _ = simulate_day(c, DAY, [("UP", "long")], {"UP": utc_bars}, {"UP": adv}, 100_000)
+    assert len(trades) == 1 and trades[0].exit_reason == "target"
+
+
+def test_backtest_reports_why_nothing_traded():
+    c = cfg(min_relative_volume=50.0)  # impossible threshold
+    d = daily({"UP": 4.0})
+    adv = 50_000 * 390 / 3
+    d["UP"] = [Bar(b.day, b.close, b.high, b.low, adv, b.open) for b in d["UP"]]
+    res = run_intraday_backtest(c, d, lambda syms, day: {"UP": session(after="rally")}, DAY, DAY)
+    assert res.trades == []
+    assert res.reasons["low relative volume"] == 1
+    assert res.rvol_at_breakout and "low relative volume" in res.summary()

@@ -25,7 +25,7 @@ from typing import Callable
 
 from ..config import Config
 from ..models import Bar, MinuteBar
-from .orb import NoSignal, evaluate_breakout, session_bars, session_close
+from .orb import NoSignal, evaluate_breakout, session_bars, session_close, session_open
 from .plan import size_position
 
 DEFAULT_UNIVERSE = (
@@ -70,6 +70,8 @@ class IntradayResult:
     halted_days: int
     watched: int
     starting_equity: float
+    reasons: Counter = field(default_factory=Counter)             # why watched symbols were not entered (one tally per symbol-day)
+    rvol_at_breakout: list[float] = field(default_factory=list)   # relative volume seen on breakouts rejected for volume
 
     @property
     def total_pnl(self) -> float:
@@ -108,6 +110,17 @@ class IntradayResult:
             f"max drawdown      {self.max_drawdown():.2f}%",
             f"loss-limit days   {self.halted_days}",
         ]
+        if self.reasons:
+            total = sum(self.reasons.values())
+            lines.append("")
+            lines.append("symbol-days without an entry, by the last reason seen:")
+            for key, count in self.reasons.most_common():
+                lines.append(f"  {key:24} {count:5}  ({count / total:.0%})")
+        if self.rvol_at_breakout:
+            xs = sorted(self.rvol_at_breakout)
+            med = xs[len(xs) // 2]
+            lines.append(f"relative volume on breakouts rejected for volume: median {med:.2f}x, max {xs[-1]:.2f}x "
+                         f"(threshold in config: min_relative_volume)")
         return "\n".join(lines)
 
     def write_trades(self, path: str | Path) -> None:
@@ -157,16 +170,29 @@ class _Open:
     entry_time: str
 
 
-def simulate_day(cfg: Config, day: date, watch: list[tuple[str, str]], minutes: dict[str, list[MinuteBar]], avg_vol: dict[str, float], equity: float) -> tuple[list[BtTrade], bool]:
+@dataclass
+class DayDiagnostics:
+    reasons: Counter = field(default_factory=Counter)
+    rvol_at_breakout: list[float] = field(default_factory=list)
+
+
+def simulate_day(cfg: Config, day: date, watch: list[tuple[str, str]], minutes: dict[str, list[MinuteBar]], avg_vol: dict[str, float], equity: float, diag: DayDiagnostics | None = None) -> tuple[list[BtTrade], bool]:
     dt = cfg.daytrade
+    diag = diag if diag is not None else DayDiagnostics()
+    last_reason: dict[str, str] = {}
     slip = dt.slippage_bps / 10_000.0
     bars = {sym: session_bars(minutes.get(sym, []), day) for sym, _ in watch}
     direction = dict(watch)
     timeline = sorted({b.t for series in bars.values() for b in series})
     if not timeline:
+        for sym, _ in watch:
+            diag.reasons["no minute bars"] += 1
         return [], False
+    for sym, _ in watch:
+        if not bars[sym]:
+            diag.reasons["no minute bars"] += 1
     flatten_at = session_close(day) - timedelta(minutes=dt.flatten_minutes_before_close)
-    entry_deadline = timeline[0].replace(hour=9, minute=30) + timedelta(minutes=dt.entry_window_minutes)
+    entry_deadline = session_open(day) + timedelta(minutes=dt.entry_window_minutes)
 
     open_pos: dict[str, _Open] = {}
     done: set[str] = set()
@@ -238,6 +264,12 @@ def simulate_day(cfg: Config, day: date, watch: list[tuple[str, str]], minutes: 
             history = bars[sym][: i + 1]
             result = evaluate_breakout(cfg, sym, history, day, avg_vol.get(sym, 0.0), direction[sym], now=t + timedelta(minutes=1))
             if isinstance(result, NoSignal):
+                if result.key and result.key not in ("no breakout", "range forming"):
+                    last_reason[sym] = result.key
+                elif sym not in last_reason:
+                    last_reason[sym] = result.key or result.reason
+                if result.key == "low relative volume" and result.rvol is not None:
+                    diag.rvol_at_breakout.append(result.rvol)
                 if result.final:
                     done.add(sym)
                 continue
@@ -257,6 +289,10 @@ def simulate_day(cfg: Config, day: date, watch: list[tuple[str, str]], minutes: 
             open_pos[sym] = _Open(sym, sized.side, sized.qty, sized.entry, sized.stop, sized.target, result.rvol, nxt.t.strftime("%H:%M"))
     for sym, pos in list(open_pos.items()):  # safety: anything still open closes at the last bar
         close_trade(pos, bars[sym][-1].c, "eod", bars[sym][-1].t)
+    traded = {t.symbol for t in trades}
+    for sym, _ in watch:
+        if sym not in traded and bars[sym]:
+            diag.reasons[last_reason.get(sym, "no breakout")] += 1
     return trades, halted
 
 
@@ -266,6 +302,7 @@ def run_intraday_backtest(cfg: Config, daily: dict[str, list[Bar]], fetch_minute
     trades: list[BtTrade] = []
     daily_pnl: dict[date, float] = {}
     halted_days = watched = 0
+    diag = DayDiagnostics()
     for day in days:
         watch, avg_vol = build_watchlist(cfg, day, daily)
         if not watch:
@@ -273,7 +310,7 @@ def run_intraday_backtest(cfg: Config, daily: dict[str, list[Bar]], fetch_minute
             continue
         watched += len(watch)
         minutes = fetch_minutes([s for s, _ in watch], day)
-        day_trades, halted = simulate_day(cfg, day, watch, minutes, avg_vol, equity)
+        day_trades, halted = simulate_day(cfg, day, watch, minutes, avg_vol, equity, diag)
         pnl = sum(t.pnl for t in day_trades)
         trades.extend(day_trades)
         daily_pnl[day] = pnl
@@ -281,4 +318,8 @@ def run_intraday_backtest(cfg: Config, daily: dict[str, list[Bar]], fetch_minute
         halted_days += int(halted)
         if progress:
             progress(day, watch, day_trades)
-    return IntradayResult(start=days[0] if days else start, end=days[-1] if days else end, days=len(days), trades=trades, daily_pnl=daily_pnl, halted_days=halted_days, watched=watched, starting_equity=starting_equity or cfg.backtest.initial_cash)
+    return IntradayResult(
+        start=days[0] if days else start, end=days[-1] if days else end, days=len(days), trades=trades, daily_pnl=daily_pnl,
+        halted_days=halted_days, watched=watched, starting_equity=starting_equity or cfg.backtest.initial_cash,
+        reasons=diag.reasons, rvol_at_breakout=diag.rvol_at_breakout,
+    )

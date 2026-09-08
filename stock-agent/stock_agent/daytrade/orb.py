@@ -117,6 +117,8 @@ class Signal:
 class NoSignal:
     reason: str
     final: bool = False  # True when this symbol is done for the day (e.g. range too wide)
+    rvol: float | None = None
+    key: str = ""        # short category for tallies
 
 
 def evaluate_breakout(
@@ -132,23 +134,23 @@ def evaluate_breakout(
     dt = cfg.daytrade
     bars = session_bars(bars, day)
     if not bars:
-        return NoSignal("no bars yet")
+        return NoSignal("no bars yet", key="no bars")
     now = now or bars[-1].t + timedelta(minutes=1)
     start = session_open(day)
     rng = opening_range(bars, day, dt.range_minutes)
     if rng is None:
-        return NoSignal("opening range still forming")
+        return NoSignal("opening range still forming", key="range forming")
     if now > start + timedelta(minutes=dt.entry_window_minutes):
-        return NoSignal("entry window closed", final=True)
+        return NoSignal("entry window closed", final=True, key="window closed")
     height_pct = rng.height_pct()
     if height_pct < dt.min_range_pct:
-        return NoSignal(f"range too narrow ({height_pct:.2f}%)", final=True)
+        return NoSignal(f"range too narrow ({height_pct:.2f}%)", final=True, key="range too narrow")
     if height_pct > dt.max_stop_pct:
-        return NoSignal(f"range too wide ({height_pct:.2f}%), stop would exceed {dt.max_stop_pct}%", final=True)
+        return NoSignal(f"range too wide ({height_pct:.2f}%), stop would exceed {dt.max_stop_pct}%", final=True, key="range too wide")
 
     after = [b for b in bars if b.t >= rng.end]
     if not after:
-        return NoSignal("waiting for the first bar after the range")
+        return NoSignal("waiting for the first bar after the range", key="range forming")
     last = after[-1]
     elapsed = int((last.t - start).total_seconds() // 60) + 1
     rvol = relative_volume(sum(b.v for b in bars), avg_daily_volume, elapsed)
@@ -166,14 +168,14 @@ def evaluate_breakout(
         vwap_ok = entry < current_vwap
 
     if not broke:
-        return NoSignal("no breakout yet")
+        return NoSignal("no breakout yet", rvol=rvol, key="no breakout")
     if rvol < dt.min_relative_volume:
-        return NoSignal(f"relative volume {rvol:.1f}x below {dt.min_relative_volume}x")
+        return NoSignal(f"relative volume {rvol:.1f}x below {dt.min_relative_volume}x", rvol=rvol, key="low relative volume")
     if dt.require_vwap_confirmation and not vwap_ok:
-        return NoSignal(f"price on the wrong side of VWAP ({current_vwap:.2f})")
+        return NoSignal(f"price on the wrong side of VWAP ({current_vwap:.2f})", rvol=rvol, key="wrong side of VWAP")
     stop_dist_pct = abs(entry - stop) / entry * 100.0
     if stop_dist_pct > dt.max_stop_pct:
-        return NoSignal(f"breakout too extended: stop {stop_dist_pct:.2f}% away", final=False)
+        return NoSignal(f"breakout too extended: stop {stop_dist_pct:.2f}% away", rvol=rvol, key="breakout too extended")
     if stop_dist_pct < dt.min_stop_pct:
         # widen a hair so the stop is not inside the noise
         stop = entry * (1 - dt.min_stop_pct / 100) if direction == "long" else entry * (1 + dt.min_stop_pct / 100)
