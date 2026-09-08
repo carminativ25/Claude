@@ -30,6 +30,8 @@ def test_shipped_config_loads():
 
     cfg = load_config(DEFAULT_CONFIG)
     assert abs(sum(cfg.targets.values()) + cfg.cash_weight - 1.0) < 1e-6
+    assert cfg.regime.defensive_symbol == "SGOV" and cfg.regime.evaluate == "monthly"
+    assert cfg.risk.order_cap(50_000) == 5_000 and cfg.risk.daily_cap(50_000) == 15_000
 
 
 def test_credentials_default_to_paper():

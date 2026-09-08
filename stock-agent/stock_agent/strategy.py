@@ -15,6 +15,7 @@ The strategy is deliberately simple and transparent:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 
 from .config import Config
 from .models import Bar, Trade
@@ -42,10 +43,21 @@ def simple_moving_average(closes: list[float], window: int) -> float | None:
     return sum(closes[-window:]) / window
 
 
-def detect_regime(cfg: Config, benchmark_bars: list[Bar]) -> Regime:
+def detect_regime(cfg: Config, benchmark_bars: list[Bar], today: date | None = None) -> Regime:
+    """Trend regime from the benchmark's close vs. its moving average.
+
+    With regime.evaluate = "monthly" the signal is taken from the last close
+    of the previous calendar month, so it can only change once a month. That
+    is the classic timing-model cadence and avoids whipsaw around the average.
+    """
     if not cfg.regime.enabled:
         return Regime("disabled")
-    closes = [b.close for b in benchmark_bars]
+    bars = sorted(benchmark_bars, key=lambda b: b.day)
+    if cfg.regime.evaluate == "monthly" and bars:
+        ref = today or bars[-1].day
+        month_start = ref.replace(day=1)
+        bars = [b for b in bars if b.day < month_start]
+    closes = [b.close for b in bars]
     sma = simple_moving_average(closes, cfg.regime.sma_days)
     if sma is None or not closes:
         return Regime("unknown")

@@ -145,7 +145,7 @@ def run_backtest(
             bench_cash = 0.0
 
         if i % max(1, bt.rebalance_every_days) == 0:
-            regime = detect_regime(cfg, bench_history)
+            regime = detect_regime(cfg, bench_history, day)
             if regime.risk_off:
                 risk_off_days += bt.rebalance_every_days
             targets, cash_weight = effective_targets(cfg, regime)
@@ -153,7 +153,7 @@ def run_backtest(
             planned = plan_trades(targets, cash_weight, holdings, broker.cash, cfg)
             history = [v for _, v in curve]
             halted = None
-            if drawdown_pct(history) > cfg.risk.max_drawdown_pct:
+            if cfg.risk.drawdown_pauses_buys and drawdown_pct(history) > cfg.risk.max_drawdown_pct:
                 halted = "drawdown limit"
             cash_available = broker.cash - broker.equity * cash_weight
             approved, _ = apply_risk_limits(cfg, planned, broker.equity, holdings, set(), halted, cash_available)

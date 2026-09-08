@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 import logging
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -53,11 +53,12 @@ def run_once(
     # but record a warning rather than trading blind on a stale signal.
     regime_symbols = [cfg.regime.benchmark] if cfg.regime.enabled else []
     try:
-        bars = broker.get_daily_bars(regime_symbols, bars_lookback_start(today, cfg.regime.sma_days), today) if regime_symbols else {}
+        # up to yesterday: today's bar is a partial print during market hours
+        bars = broker.get_daily_bars(regime_symbols, bars_lookback_start(today, cfg.regime.sma_days), today - timedelta(days=1)) if regime_symbols else {}
     except BrokerError as exc:
         bars = {}
         report.warnings.append(f"could not load benchmark bars: {exc}")
-    regime = detect_regime(cfg, bars.get(cfg.regime.benchmark, []))
+    regime = detect_regime(cfg, bars.get(cfg.regime.benchmark, []), today)
     if regime.name == "unknown":
         report.warnings.append("not enough benchmark history to detect regime; assuming risk-on")
     report.regime = regime.describe()
@@ -73,8 +74,12 @@ def run_once(
         dd = 0.0
         report.warnings.append(f"could not load equity history: {exc}")
     if dd > cfg.risk.max_drawdown_pct:
-        buys_halted = f"drawdown {dd:.1f}% exceeds limit {cfg.risk.max_drawdown_pct:.1f}%; buys paused"
-        report.warnings.append(buys_halted)
+        msg = f"drawdown {dd:.1f}% exceeds {cfg.risk.max_drawdown_pct:.1f}% from the 1-year peak"
+        if cfg.risk.drawdown_pauses_buys:
+            buys_halted = msg + "; buys paused"
+            report.warnings.append(buys_halted)
+        else:
+            report.warnings.append(msg + "; still investing (risk.drawdown_pauses_buys is off)")
 
     planned = plan_trades(targets, cash_weight, holdings, account.cash, cfg)
     report.planned = planned

@@ -50,6 +50,8 @@ def apply_risk_limits(
     rejected: list[tuple[Trade, str]] = []
     daily_total = 0.0
     budget = float("inf") if cash_available is None else max(0.0, cash_available)
+    order_cap = risk.order_cap(total_equity)
+    daily_cap = risk.daily_cap(total_equity)
 
     for trade in sorted(trades, key=lambda t: 0 if t.side == "sell" else 1):
         if trade.symbol in open_order_symbols:
@@ -75,8 +77,8 @@ def apply_risk_limits(
                 notional = room
                 notes.append("clipped to max position weight")
 
-        if notional > risk.max_order_value:
-            notional = risk.max_order_value
+        if notional > order_cap:
+            notional = order_cap
             notes.append("clipped to max order value")
 
         if trade.side == "buy":
@@ -87,7 +89,7 @@ def apply_risk_limits(
                 notional = budget
                 notes.append("clipped to available cash")
 
-        remaining_daily = risk.max_daily_trade_value - daily_total
+        remaining_daily = daily_cap - daily_total
         if remaining_daily <= 0:
             rejected.append((trade, "daily trade value limit reached"))
             continue

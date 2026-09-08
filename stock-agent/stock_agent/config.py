@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -23,15 +23,25 @@ class RegimeConfig:
     sma_days: int = 200
     risk_off_equity_scale: float = 0.5
     defensive_symbol: str | None = "BND"
+    evaluate: str = "monthly"     # monthly: use the last close of the previous month; daily: use yesterday's close
 
 
 @dataclass(frozen=True)
 class RiskConfig:
-    max_order_value: float = 2_000.0
-    max_daily_trade_value: float = 5_000.0
+    max_order_value: float = 2_000.0        # dollar cap per order (used when max_order_pct is 0)
+    max_daily_trade_value: float = 5_000.0  # dollar cap per run (used when max_daily_trade_pct is 0)
+    max_order_pct: float = 0.0              # per-order cap as % of equity; overrides the dollar cap when > 0
+    max_daily_trade_pct: float = 0.0        # per-run cap as % of equity; overrides the dollar cap when > 0
     max_position_weight: float = 0.40
-    max_drawdown_pct: float = 20.0
+    max_drawdown_pct: float = 20.0          # beyond this drawdown from the 1-year peak: alert ...
+    drawdown_pauses_buys: bool = False      # ... and, if true, also stop buying (off: a long-term investor keeps buying dips)
     require_market_open: bool = True
+
+    def order_cap(self, equity: float) -> float:
+        return equity * self.max_order_pct / 100.0 if self.max_order_pct > 0 else self.max_order_value
+
+    def daily_cap(self, equity: float) -> float:
+        return equity * self.max_daily_trade_pct / 100.0 if self.max_daily_trade_pct > 0 else self.max_daily_trade_value
 
 
 @dataclass(frozen=True)
@@ -180,14 +190,10 @@ def parse_config(raw: dict[str, Any]) -> Config:
             f"Target weights plus cash buffer must sum to 1.0 (got {total:.4f}). "
             "Adjust 'targets' or 'trading.cash_buffer_pct'."
         )
+    regime = replace(regime, benchmark=regime.benchmark.upper(), defensive_symbol=regime.defensive_symbol.upper() if regime.defensive_symbol else None)
+    if regime.evaluate not in ("monthly", "daily"):
+        raise ConfigError("regime.evaluate must be monthly or daily")
     if regime.enabled and regime.defensive_symbol:
-        regime = RegimeConfig(
-            enabled=regime.enabled,
-            benchmark=regime.benchmark.upper(),
-            sma_days=regime.sma_days,
-            risk_off_equity_scale=regime.risk_off_equity_scale,
-            defensive_symbol=regime.defensive_symbol.upper(),
-        )
         if regime.defensive_symbol not in targets:
             raise ConfigError(
                 f"regime.defensive_symbol {regime.defensive_symbol} must also appear in 'targets'"

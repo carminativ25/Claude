@@ -69,3 +69,11 @@ def test_no_cash_rejects_buys(cfg):
     approved, rejected = apply_risk_limits(cfg, [Trade("SCHD", "buy", 500, "x")], 10_000, {}, set(), cash_available=2.0)
     assert approved == []
     assert "not enough cash" in rejected[0][1]
+
+
+def test_percent_caps_scale_with_equity():
+    cfg = make_config(risk={"max_order_pct": 10.0, "max_daily_trade_pct": 25.0})
+    trades = [Trade("SCHD", "buy", 50_000, "x"), Trade("VTI", "buy", 50_000, "x"), Trade("BND", "buy", 50_000, "x")]
+    approved, rejected = apply_risk_limits(cfg, trades, 100_000, {}, set())
+    assert [t.notional for t in approved] == [10_000, 10_000, 5_000]
+    assert not rejected

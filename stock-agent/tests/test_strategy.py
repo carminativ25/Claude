@@ -89,3 +89,12 @@ def test_dust_is_ignored(cfg):
     holdings = {"SCHD": 3000, "VYM": 1500, "VTI": 2500, "JEPI": 1200, "BND": 1500}
     trades = plan_trades(cfg.targets, cfg.cash_weight, holdings, 303.0, cfg)  # only $3 above buffer
     assert trades == []
+
+
+def test_monthly_regime_uses_previous_month_close():
+    cfg = make_config(regime={"evaluate": "monthly", "sma_days": 3})
+    # Jan closes rising (risk-on at month end); Feb crashes but the monthly signal ignores Feb until March
+    bars_list = [Bar(date(2024, 1, d), 100 + d) for d in (26, 29, 30, 31)] + [Bar(date(2024, 2, d), c) for d, c in ((1, 60), (2, 55), (5, 50))]
+    assert detect_regime(cfg, bars_list, today=date(2024, 2, 6)).name == "risk-on"
+    assert detect_regime(cfg, bars_list, today=date(2024, 3, 1)).name == "risk-off"
+    assert detect_regime(cfg, bars_list[:1], today=date(2024, 2, 6)).name == "unknown"

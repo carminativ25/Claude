@@ -62,7 +62,16 @@ def test_risk_off_moves_into_defensive():
     assert abs(weights["SCHD"] - 0.15) < 0.001
 
 
-def test_drawdown_pauses_buys_but_not_sells(cfg):
+def test_drawdown_only_warns_by_default(cfg):
+    broker = with_bars(SimBroker(cash=10_000, prices=PRICES), [480, 485, 490, 495, 500, 505])
+    broker.equity_history = [15_000, 9_000]
+    report = run_once(cfg, broker, dry_run=False)
+    assert any("still investing" in w for w in report.warnings)
+    assert any(o.side == "buy" for o in report.submitted)
+
+
+def test_drawdown_pauses_buys_but_not_sells():
+    cfg = make_config(risk={"drawdown_pauses_buys": True})
     broker = with_bars(SimBroker(cash=1_000, prices=PRICES), [480, 485, 490, 495, 500, 505])
     broker.shares = {"SCHD": 100}  # $8000 -> heavily overweight
     broker.equity_history = [15_000, 9_000]  # 40% drawdown
