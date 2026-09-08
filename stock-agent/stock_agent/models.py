@@ -15,6 +15,8 @@ class Account:
     trading_blocked: bool = False
     account_blocked: bool = False
     pattern_day_trader: bool = False
+    last_equity: float = 0.0      # equity at the previous close
+    daytrade_count: int = 0       # day trades in the last 5 business days
 
 
 @dataclass(frozen=True)
@@ -42,12 +44,68 @@ class Clock:
     is_open: bool
     next_open: str = ""
     next_close: str = ""
+    timestamp: str = ""
+
+
+@dataclass(frozen=True)
+class Quote:
+    symbol: str
+    bid: float
+    ask: float
+
+    @property
+    def mid(self) -> float:
+        return (self.bid + self.ask) / 2 if self.bid > 0 and self.ask > 0 else max(self.bid, self.ask)
+
+    @property
+    def spread_pct(self) -> float:
+        return (self.ask - self.bid) / self.mid * 100 if self.mid > 0 and self.bid > 0 else 100.0
+
+
+@dataclass(frozen=True)
+class NewsItem:
+    headline: str
+    summary: str
+    symbols: tuple[str, ...]
+    source: str
+    created_at: str
+    url: str = ""
+
+
+@dataclass(frozen=True)
+class Mover:
+    symbol: str
+    price: float
+    percent_change: float
+    volume: float = 0.0
+
+
+@dataclass(frozen=True)
+class Asset:
+    symbol: str
+    tradable: bool
+    exchange: str
+    shortable: bool = False
+    fractionable: bool = False
+    asset_class: str = "us_equity"
+
+
+@dataclass(frozen=True)
+class Fill:
+    symbol: str
+    side: str
+    qty: float
+    price: float
+    time: str
 
 
 @dataclass(frozen=True)
 class Bar:
     day: date
     close: float
+    high: float = 0.0
+    low: float = 0.0
+    volume: float = 0.0
 
 
 @dataclass(frozen=True)

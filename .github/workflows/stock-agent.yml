@@ -1,21 +1,26 @@
 name: stock-agent
 
+# Weekday schedule in UTC. 13:30 UTC is 9:30 ET during daylight time; in
+# winter (EST) every time below is one hour early relative to the market.
+# Scheduled workflows can also start late. Use cron on a real machine for
+# anything you rely on; this is a convenient way to try the cycle.
 on:
   schedule:
-    # Weekdays at 14:35 UTC (10:35 ET during daylight time, 9:35 ET in winter).
-    # The agent itself checks the market clock and does nothing when closed.
-    - cron: "35 14 * * 1-5"
+    - cron: "45 12 * * 1-5"        # plan     (~8:45 ET)
+    - cron: "36 13 * * 1-5"        # open     (~9:36 ET)
+    - cron: "*/15 14-19 * * 1-5"   # monitor  (10:00-19:45 UTC)
+    - cron: "52 19 * * 1-5"        # close    (~15:52 ET)
   workflow_dispatch:
     inputs:
+      command:
+        description: "plan | open | monitor | close | review | check"
+        type: choice
+        default: plan
+        options: [plan, open, monitor, close, review, check]
       execute:
         description: "Submit orders (paper account). Leave false for a dry run."
         type: boolean
         default: false
-      command:
-        description: "Command to run: run, status, income, check"
-        type: choice
-        default: run
-        options: [run, status, income, check]
 
 permissions:
   contents: read
@@ -30,6 +35,7 @@ jobs:
     env:
       ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
       ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
       # Live trading is intentionally NOT wired up here. Paper only.
     steps:
@@ -38,18 +44,40 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
-      - name: Run agent
+      - name: Pick command from schedule
+        id: pick
         run: |
-          CMD="${{ github.event.inputs.command || 'run' }}"
-          if [ "$CMD" = "run" ] && [ "${{ github.event.inputs.execute }}" = "true" ]; then
-            python -m stock_agent run --execute
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "cmd=${{ github.event.inputs.command }}" >> "$GITHUB_OUTPUT"
+            echo "exec=${{ github.event.inputs.execute }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          case "${{ github.event.schedule }}" in
+            "45 12 * * 1-5") cmd=plan ;;
+            "36 13 * * 1-5") cmd=open ;;
+            "52 19 * * 1-5") cmd=close ;;
+            *) cmd=monitor ;;
+          esac
+          echo "cmd=$cmd" >> "$GITHUB_OUTPUT"
+          echo "exec=false" >> "$GITHUB_OUTPUT"   # change to true to trade on the paper account
+      - name: Restore journal
+        uses: actions/cache@v4
+        with:
+          path: stock-agent/journal
+          key: journal-${{ github.run_id }}
+          restore-keys: journal-
+      - name: Run
+        run: |
+          CMD="${{ steps.pick.outputs.cmd }}"
+          if [ "${{ steps.pick.outputs.exec }}" = "true" ] && [ "$CMD" != "plan" ] && [ "$CMD" != "review" ] && [ "$CMD" != "check" ]; then
+            python -m stock_agent "$CMD" --execute
           else
             python -m stock_agent "$CMD"
           fi
-      - name: Keep trade log
+      - name: Upload journal
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trade-log-${{ github.run_id }}
-          path: stock-agent/logs/
+          name: journal-${{ github.run_id }}
+          path: stock-agent/journal/
           if-no-files-found: ignore

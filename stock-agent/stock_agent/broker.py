@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Protocol
 
 import requests
 
 from .config import Credentials
-from .models import Account, Bar, Clock, Dividend, Order, Position
+from .models import Account, Asset, Bar, Clock, Dividend, Fill, Mover, NewsItem, Order, Position, Quote
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +33,16 @@ class Broker(Protocol):
     def get_daily_bars(self, symbols: list[str], start: date, end: date) -> dict[str, list[Bar]]: ...
     def get_equity_history(self, period: str = "1A") -> list[float]: ...
     def get_dividends(self, since: date) -> list[Dividend]: ...
+    # day-trading surface
+    def submit_bracket_order(self, symbol: str, side: str, qty: int, take_profit: float, stop_loss: float) -> Order: ...
+    def cancel_all_orders(self) -> None: ...
+    def close_all_positions(self) -> list[Order]: ...
+    def get_latest_quotes(self, symbols: list[str]) -> dict[str, Quote]: ...
+    def get_news(self, since: datetime, limit: int = 50, symbols: list[str] | None = None) -> list[NewsItem]: ...
+    def get_movers(self, top: int = 20) -> tuple[list[Mover], list[Mover]]: ...
+    def get_most_active(self, top: int = 20) -> list[Mover]: ...
+    def get_asset(self, symbol: str) -> Asset | None: ...
+    def get_fills(self, day: date) -> list[Fill]: ...
 
 
 def _f(value, default: float = 0.0) -> float:
@@ -107,6 +117,8 @@ class AlpacaBroker:
             trading_blocked=bool(raw.get("trading_blocked", False)),
             account_blocked=bool(raw.get("account_blocked", False)),
             pattern_day_trader=bool(raw.get("pattern_day_trader", False)),
+            last_equity=_f(raw.get("last_equity")),
+            daytrade_count=int(raw.get("daytrade_count") or 0),
         )
 
     def get_positions(self) -> list[Position]:
@@ -128,7 +140,12 @@ class AlpacaBroker:
 
     def get_clock(self) -> Clock:
         raw = self._trading("GET", "/v2/clock")
-        return Clock(is_open=bool(raw.get("is_open")), next_open=str(raw.get("next_open", "")), next_close=str(raw.get("next_close", "")))
+        return Clock(
+            is_open=bool(raw.get("is_open")),
+            next_open=str(raw.get("next_open", "")),
+            next_close=str(raw.get("next_close", "")),
+            timestamp=str(raw.get("timestamp", "")),
+        )
 
     # -- orders ------------------------------------------------------------
     def submit_notional_order(self, symbol: str, side: str, notional: float) -> Order:
@@ -149,6 +166,55 @@ class AlpacaBroker:
     def get_order(self, order_id: str) -> Order:
         return _parse_order(self._trading("GET", f"/v2/orders/{order_id}"))
 
+    def submit_bracket_order(self, symbol: str, side: str, qty: int, take_profit: float, stop_loss: float) -> Order:
+        """Market entry with an attached take-profit limit and stop-loss. Whole shares only."""
+        payload = {
+            "symbol": symbol,
+            "side": side,
+            "type": "market",
+            "time_in_force": "day",
+            "qty": str(int(qty)),
+            "order_class": "bracket",
+            "take_profit": {"limit_price": f"{take_profit:.2f}"},
+            "stop_loss": {"stop_price": f"{stop_loss:.2f}"},
+        }
+        return _parse_order(self._trading("POST", "/v2/orders", json=payload, retries=1))
+
+    def cancel_all_orders(self) -> None:
+        self._trading("DELETE", "/v2/orders", retries=1)
+
+    def close_all_positions(self) -> list[Order]:
+        raw = self._trading("DELETE", "/v2/positions", params={"cancel_orders": "true"}, retries=1) or []
+        out = []
+        for item in raw:
+            body = item.get("body") if isinstance(item, dict) and "body" in item else item
+            if isinstance(body, dict) and body.get("symbol"):
+                out.append(_parse_order(body))
+        return out
+
+    def get_asset(self, symbol: str) -> Asset | None:
+        try:
+            raw = self._trading("GET", f"/v2/assets/{symbol}")
+        except BrokerError as exc:
+            if "404" in str(exc):
+                return None
+            raise
+        return Asset(
+            symbol=str(raw.get("symbol", symbol)).upper(),
+            tradable=bool(raw.get("tradable")) and str(raw.get("status", "")).lower() == "active",
+            exchange=str(raw.get("exchange", "")),
+            shortable=bool(raw.get("shortable")),
+            fractionable=bool(raw.get("fractionable")),
+            asset_class=str(raw.get("class", "us_equity")),
+        )
+
+    def get_fills(self, day: date) -> list[Fill]:
+        raw = self._trading("GET", "/v2/account/activities/FILL", params={"date": day.isoformat(), "page_size": 100}) or []
+        return [
+            Fill(symbol=str(a.get("symbol", "")).upper(), side=str(a.get("side", "")), qty=_f(a.get("qty")), price=_f(a.get("price")), time=str(a.get("transaction_time", "")))
+            for a in raw
+        ]
+
     # -- market data -------------------------------------------------------
     def get_latest_prices(self, symbols: list[str]) -> dict[str, float]:
         if not symbols:
@@ -160,6 +226,48 @@ class AlpacaBroker:
         if missing:
             raise BrokerError(f"No recent price for {missing}")
         return prices
+
+    def get_latest_quotes(self, symbols: list[str]) -> dict[str, Quote]:
+        if not symbols:
+            return {}
+        out: dict[str, Quote] = {}
+        for i in range(0, len(symbols), 100):
+            chunk = symbols[i : i + 100]
+            raw = self._data("GET", "/v2/stocks/quotes/latest", params={"symbols": ",".join(chunk), "feed": "iex"})
+            for sym, q in (raw.get("quotes") or {}).items():
+                out[sym.upper()] = Quote(symbol=sym.upper(), bid=_f(q.get("bp")), ask=_f(q.get("ap")))
+        return out
+
+    def get_news(self, since: datetime, limit: int = 50, symbols: list[str] | None = None) -> list[NewsItem]:
+        params: dict = {"start": since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "limit": min(limit, 50), "sort": "desc", "exclude_contentless": "true"}
+        if symbols:
+            params["symbols"] = ",".join(symbols)
+        raw = self._data("GET", "/v1beta1/news", params=params)
+        items = []
+        for n in raw.get("news") or []:
+            items.append(
+                NewsItem(
+                    headline=str(n.get("headline", "")).strip(),
+                    summary=str(n.get("summary", "")).strip(),
+                    symbols=tuple(str(x).upper() for x in (n.get("symbols") or [])),
+                    source=str(n.get("source", "")),
+                    created_at=str(n.get("created_at", "")),
+                    url=str(n.get("url", "")),
+                )
+            )
+        return items
+
+    def get_movers(self, top: int = 20) -> tuple[list[Mover], list[Mover]]:
+        raw = self._data("GET", "/v1beta1/screener/stocks/movers", params={"top": top})
+
+        def conv(rows):
+            return [Mover(symbol=str(r["symbol"]).upper(), price=_f(r.get("price")), percent_change=_f(r.get("percent_change"))) for r in rows or []]
+
+        return conv(raw.get("gainers")), conv(raw.get("losers"))
+
+    def get_most_active(self, top: int = 20) -> list[Mover]:
+        raw = self._data("GET", "/v1beta1/screener/stocks/most-actives", params={"by": "volume", "top": top})
+        return [Mover(symbol=str(r["symbol"]).upper(), price=0.0, percent_change=0.0, volume=_f(r.get("volume"))) for r in raw.get("most_actives") or []]
 
     def get_daily_bars(self, symbols: list[str], start: date, end: date) -> dict[str, list[Bar]]:
         out: dict[str, list[Bar]] = {s: [] for s in symbols}
@@ -177,7 +285,14 @@ class AlpacaBroker:
             raw = self._data("GET", "/v2/stocks/bars", params=params)
             for sym, bars in (raw.get("bars") or {}).items():
                 out.setdefault(sym.upper(), []).extend(
-                    Bar(day=datetime.fromisoformat(b["t"].replace("Z", "+00:00")).date(), close=_f(b["c"])) for b in bars
+                    Bar(
+                        day=datetime.fromisoformat(b["t"].replace("Z", "+00:00")).date(),
+                        close=_f(b["c"]),
+                        high=_f(b.get("h"), _f(b["c"])),
+                        low=_f(b.get("l"), _f(b["c"])),
+                        volume=_f(b.get("v")),
+                    )
+                    for b in bars
                 )
             token = raw.get("next_page_token")
             if not token:
@@ -223,6 +338,19 @@ class SimBroker:
         self.equity_history: list[float] = []
         self.dividends: list[Dividend] = []
         self._next_id = 1
+        # day-trading state (set by tests / backtests)
+        self.last_equity = cash
+        self.daytrade_count = 0
+        self.quotes: dict[str, Quote] = {}
+        self.news: list[NewsItem] = []
+        self.gainers: list[Mover] = []
+        self.losers: list[Mover] = []
+        self.actives: list[Mover] = []
+        self.assets: dict[str, Asset] = {}
+        self.fills: list[Fill] = []
+        self.brackets: list[dict] = []
+        self.clock_timestamp = ""
+        self.next_close = ""
 
     # helpers for callers
     def set_prices(self, prices: dict[str, float]) -> None:
@@ -237,7 +365,7 @@ class SimBroker:
 
     # Broker protocol
     def get_account(self) -> Account:
-        return Account(equity=self.equity, cash=self.cash, buying_power=self.cash)
+        return Account(equity=self.equity, cash=self.cash, buying_power=self.cash, last_equity=self.last_equity, daytrade_count=self.daytrade_count)
 
     def get_positions(self) -> list[Position]:
         return [
@@ -250,7 +378,58 @@ class SimBroker:
         return list(self.open_orders)
 
     def get_clock(self) -> Clock:
-        return Clock(is_open=self.market_open)
+        return Clock(is_open=self.market_open, next_close=self.next_close, timestamp=self.clock_timestamp)
+
+    def submit_bracket_order(self, symbol: str, side: str, qty: int, take_profit: float, stop_loss: float) -> Order:
+        price = self.prices.get(symbol)
+        if not price:
+            raise BrokerError(f"no price for {symbol}")
+        if side != "buy":
+            raise BrokerError("SimBroker brackets are long-only")
+        notional = qty * price
+        if notional > self.cash + 1e-6:
+            raise BrokerError(f"insufficient cash for {symbol}")
+        self.cash -= notional
+        self.shares[symbol] = self.shares.get(symbol, 0.0) + qty
+        self.fills.append(Fill(symbol, "buy", qty, price, self.clock_timestamp))
+        self.brackets.append({"symbol": symbol, "qty": qty, "take_profit": take_profit, "stop_loss": stop_loss})
+        return self._new_order(symbol, side, notional, qty)
+
+    def cancel_all_orders(self) -> None:
+        self.open_orders = []
+
+    def close_all_positions(self) -> list[Order]:
+        self.open_orders = []
+        out = []
+        for symbol in list(self.shares):
+            if self.shares[symbol] > 1e-9:
+                qty = self.shares[symbol]
+                order = self.close_position(symbol)
+                self.fills.append(Fill(symbol, "sell", qty, self.prices.get(symbol, 0.0), self.clock_timestamp))
+                out.append(order)
+        return out
+
+    def get_latest_quotes(self, symbols: list[str]) -> dict[str, Quote]:
+        return {s: self.quotes[s] for s in symbols if s in self.quotes}
+
+    def get_news(self, since: datetime, limit: int = 50, symbols: list[str] | None = None) -> list[NewsItem]:
+        items = self.news
+        if symbols:
+            wanted = set(symbols)
+            items = [n for n in items if wanted & set(n.symbols)]
+        return items[:limit]
+
+    def get_movers(self, top: int = 20) -> tuple[list[Mover], list[Mover]]:
+        return self.gainers[:top], self.losers[:top]
+
+    def get_most_active(self, top: int = 20) -> list[Mover]:
+        return self.actives[:top]
+
+    def get_asset(self, symbol: str) -> Asset | None:
+        return self.assets.get(symbol, Asset(symbol=symbol, tradable=True, exchange="NASDAQ"))
+
+    def get_fills(self, day: date) -> list[Fill]:
+        return list(self.fills)
 
     def _new_order(self, symbol: str, side: str, notional: float, qty: float) -> Order:
         order = Order(id=f"sim-{self._next_id}", symbol=symbol, side=side, status="filled", notional=notional, qty=qty, filled_avg_price=self.prices[symbol])

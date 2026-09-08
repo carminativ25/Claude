@@ -1,11 +1,38 @@
-# Stock investment agent configuration.
+# Stock agent configuration.
 #
-# This is an EXAMPLE allocation, not financial advice. Diversified,
-# income-oriented ETFs are used because the goal is dividend income with
-# low turnover. Edit the weights to match your own plan.
+# The primary workflow is the news-driven DAY TRADING strategy (section
+# "daytrade"). The long-term ETF "portfolio" strategy below it is still
+# available via `stock-agent portfolio ...`.
 #
-# Target weights + trading.cash_buffer_pct must sum to 100%.
+# Nothing here is financial advice. Paper trade first.
 
+daytrade:
+  max_picks: 3                   # positions opened per day
+  risk_per_trade_pct: 0.5        # max % of equity lost if a stop is hit (sets share count)
+  max_position_pct: 20.0         # max % of equity in one position
+  max_daily_loss_pct: 2.0        # flatten everything and stop for the day
+  min_price: 5.0                 # ignore penny stocks ...
+  max_price: 1000.0              # ... and very expensive ones (whole-share sizing)
+  min_avg_dollar_volume: 20000000  # 20-day average $ traded per day; keeps you in liquid names
+  max_spread_pct: 0.3            # skip anything with a bid/ask spread wider than this
+  min_stop_pct: 0.75             # stop distance bounds; the analyst's stop is clamped into this range
+  max_stop_pct: 4.0
+  min_reward_risk: 1.5           # target must be at least this multiple of the stop
+  allow_short: false             # long only by default
+  entry_delay_minutes: 5         # schedule 'open' this long after 9:30 ET
+  flatten_minutes_before_close: 10
+  news_lookback_hours: 18        # headlines since yesterday afternoon
+  screener_top: 25               # top gainers / losers / most-active to consider
+  respect_pdt_rule: true         # under $25k equity: at most 3 day trades per 5 business days
+  analyst_model: claude-opus-5   # Claude model used to write the morning game plan
+  analyst_effort: high           # low | medium | high | xhigh | max
+  blocklist: []                  # symbols never to trade, e.g. [TSLA, GME]
+  journal_dir: journal
+
+# ---------------------------------------------------------------------------
+# Long-term ETF portfolio (`stock-agent portfolio ...`). Example allocation.
+# Target weights + trading.cash_buffer_pct must sum to 100%.
+# ---------------------------------------------------------------------------
 targets:
   SCHD: 0.30   # US dividend-growth stocks
   VYM:  0.15   # US high-dividend-yield stocks

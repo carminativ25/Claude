@@ -1,53 +1,33 @@
-# Stock Investment Agent
+# Stock Agent: news-driven day trading on Alpaca
 
-A small, transparent, rules-based agent that runs an income-oriented ETF
-portfolio through the [Alpaca](https://alpaca.markets) brokerage API.
+An automated intraday trading desk in a small Python package. Every trading
+day it:
 
-It is designed for the "set it up once, let it run" use case:
+1. **Reads the overnight news** and the pre-market screeners (top gainers,
+   losers, most active) through the Alpaca data API.
+2. **Screens for tradeable names**: price range, 20-day dollar volume,
+   bid/ask spread, listed on a real exchange, not on your blocklist.
+3. **Writes a game plan** by sending the headlines and candidate statistics
+   to Claude, which returns a structured JSON plan: which stocks, why, where
+   the stop goes, where the target is, and what to avoid. A deterministic
+   rules-based analyst is used when no Anthropic key is configured or the
+   model call fails.
+4. **Opens positions shortly after the bell** with bracket orders: market
+   entry plus an attached stop-loss and take-profit. Share count is derived
+   from the stop distance so a stop-out costs a fixed fraction of equity.
+5. **Monitors intraday**: if the account is down more than the daily loss
+   limit, everything is flattened and trading stops for the day.
+6. **Flattens before the close**, records realized P&L per symbol in a
+   journal, and lets you review win rate, expectancy and profit factor over
+   time.
 
-- holds a fixed target allocation of diversified dividend / index / bond ETFs,
-- reinvests every dollar of idle cash and every dividend automatically,
-- shifts toward bonds when the market trend turns down (200-day moving average),
-- rebalances only when a holding drifts well past its target (low turnover),
-- refuses to do anything outside a set of hard risk limits,
-- reports what it did (console, CSV trade log, optional Slack/Discord webhook),
-- can be backtested on real daily prices before you trust it with money.
-
-> **Read this first.** No software can guarantee passive income. Stocks and
-> ETFs go down as well as up, dividends get cut, and a strategy that looked
-> good in a backtest can lose money going forward. This agent is a tool for
-> executing *your* plan consistently, not a source of returns. Run it on a
-> paper account for a while, read the code, and only then decide whether to
-> point it at real money. Nothing here is financial advice.
-
-## How it decides
-
-Every run does the same five steps:
-
-1. **Observe.** Pull account, positions, open orders, market clock, the last
-   year of portfolio equity, and the benchmark's recent daily closes.
-2. **Regime.** If the benchmark (SPY by default) closes below its 200-day
-   simple moving average the agent is "risk-off": equity targets are scaled
-   down (50% by default) and the freed weight moves into the defensive asset
-   (BND). Above the average, the normal targets apply.
-3. **Plan.** Compare each holding's value with its target. Any holding more
-   than `drift_threshold_pct` *above* target is sold down to target. All cash
-   above the cash buffer (plus sale proceeds) is spent on the most underweight
-   holdings first, then spread by target weight. Dividends land as cash, so
-   this step is also the dividend reinvestment.
-4. **Risk limits.** Every planned trade passes through hard caps: per-order
-   value, total value per run, maximum position weight, only symbols in your
-   allocation, no symbol with an open order, and a cash budget so buys can
-   never exceed what the sells actually free up. If the account is more than
-   `max_drawdown_pct` below its 1-year peak, buying pauses (sells still run
-   so the risk-off shift can complete).
-5. **Act and report.** Sells are submitted first and the agent waits for them
-   to fill before submitting buys. Market orders in dollar amounts
-   (fractional shares) are used so small accounts work fine. A summary is
-   printed and, if configured, posted to your webhook.
-
-The run is stateless: everything it needs comes from the broker, so it can
-run from cron, a GitHub Actions schedule, or by hand.
+> **Read this first.** Day trading is a negative-sum game after costs for
+> most participants, and news-driven trades at the open are crowded and
+> slippage-prone. This agent exists so you can *measure* whether the
+> approach makes money on a paper account before risking real capital. It
+> defaults to Alpaca paper trading, refuses live trading without two
+> explicit opt-ins, and never trades without a stop. None of this is
+> financial advice. Expect losing days and losing weeks.
 
 ## Setup
 
@@ -55,96 +35,146 @@ run from cron, a GitHub Actions schedule, or by hand.
 cd stock-agent
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
-cp .env.example .env         # then paste your Alpaca PAPER keys into .env
-set -a; source .env; set +a  # export them into the shell
-python -m stock_agent check  # validates config and credentials
+cp .env.example .env        # paste your Alpaca PAPER keys and an Anthropic key
+set -a; source .env; set +a
+python -m stock_agent check
 ```
 
-Get API keys from the Alpaca dashboard. Start with the paper-trading keys;
-the agent uses the paper endpoint unless you explicitly enable live trading
-(see below).
+`check` validates the config, confirms broker access, reports whether the
+account is under the $25k pattern-day-trader threshold, and says whether
+the Claude analyst is configured.
 
-## Usage
+## The daily cycle
 
-```bash
-python -m stock_agent run              # dry run: prints what it would do
-python -m stock_agent run --execute    # submit orders on the paper account
-python -m stock_agent status           # holdings vs. targets
-python -m stock_agent income --days 365   # dividend income report
-python -m stock_agent backtest --start 2018-01-01 --curve equity.csv
+| When (ET) | Command | What it does |
+|-----------|---------|--------------|
+| ~8:45 | `python -m stock_agent plan` | Scan news + screeners, ask Claude, save `journal/plans/YYYY-MM-DD.json` |
+| 9:35 | `python -m stock_agent open --execute` | Size each pick and submit bracket orders |
+| every 10 min | `python -m stock_agent monitor --execute` | Enforce the daily loss limit; flatten in the last 10 minutes |
+| 15:52 | `python -m stock_agent close --execute` | Belt-and-braces flatten and journal the day's P&L |
+| any time | `python -m stock_agent review --trades` | Performance statistics from the journal |
+
+Without `--execute` every command is a dry run that prints what it would
+do. Run the cycle that way for a few days before switching it on, then run
+it on paper for at least a month and look at `review` before considering
+real money.
+
+### Example plan output
+
+```
+game plan for 2026-09-08 (claude:claude-opus-5)
+Earnings-heavy morning; ACME raised full-year guidance and is gapping 8% on 3x volume...
+
+LONG  ACME   conf 0.72  stop -2.50%  target +5.00%  (R:R 2.0)
+      catalyst: Q3 beat, FY guidance raised 12%
+      thesis:   Guidance raise on a large-cap with room above the prior high; invalidated if it loses the opening range.
+skip  MEME   thin volume and no company-level news
+plan saved to journal/plans/2026-09-08.json
 ```
 
-`run` writes every submitted order to `logs/trades.csv`.
+## Risk rules
 
-### Backtesting
+All of these are enforced in code, not left to the analyst:
 
-`backtest` downloads split- and dividend-adjusted daily bars for your
-allocation and benchmark, then simulates the strategy with the initial
-deposit and monthly contribution from `config.yaml`. It reports final value,
-annualized internal rate of return, and maximum drawdown next to a plain
-buy-and-hold of the benchmark with identical contributions. Fills happen at
-the daily close with no commissions or slippage, so treat the numbers as an
-upper bound. Free Alpaca data starts around 2016.
+| Rule | Default | Where |
+|------|---------|-------|
+| Max positions per day | 3 | `daytrade.max_picks` |
+| Loss per trade if the stop hits | 0.5% of equity | `daytrade.risk_per_trade_pct` (sets share count) |
+| Max size of one position | 20% of equity | `daytrade.max_position_pct` |
+| Daily loss limit | 2% of previous-close equity | `daytrade.max_daily_loss_pct` (flattens and halts) |
+| Stop distance bounds | 0.75% to 4% | `daytrade.min_stop_pct` / `max_stop_pct` |
+| Minimum reward-to-risk | 1.5x | `daytrade.min_reward_risk` |
+| Liquidity | $20M average daily dollar volume, spread under 0.3% | `daytrade.min_avg_dollar_volume` / `max_spread_pct` |
+| Shorting | off | `daytrade.allow_short` |
+| Pattern day trader rule | on | `daytrade.respect_pdt_rule` |
+| Overnight exposure | none | `monitor` / `close` flatten before the bell |
 
-### Running on a schedule
+The analyst can only choose from the screened candidates, cannot set
+position size, and its stops and targets are clamped into the configured
+bounds. If Claude proposes a symbol that failed the screen, it is dropped
+and the reason is recorded in the plan.
 
-Two options are included:
+**Pattern day trader rule.** US margin accounts under $25,000 may make at
+most three day trades in five business days. The agent reads the broker's
+day-trade counter and caps new entries accordingly. With a small account
+this means one or two trades a week, not three a day. Alpaca paper accounts
+start at $100k, so paper results will not reflect this constraint unless
+you reset the paper balance.
 
-- **GitHub Actions**: `.github/workflows/stock-agent.yml` (repo root) runs a
-  dry run every weekday shortly after the US market opens. Add
-  `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` (and optionally
-  `ALERT_WEBHOOK_URL`) as repository secrets, then flip the `execute` input
-  when triggering it by hand, or change the scheduled step to
-  `--execute` once you are happy with the dry runs.
-- **cron** on any machine:
-  `35 9 * * 1-5 cd /path/to/stock-agent && . .env && python -m stock_agent run --execute >> logs/agent.log 2>&1`
-  (adjust for your time zone; the agent skips the run when the market is closed).
+## The Claude analyst
 
-Running once a day is plenty for this strategy.
+The morning call uses the Anthropic SDK with structured JSON output, so the
+plan always matches the schema in `stock_agent/daytrade/analyst.py`.
+Adaptive thinking is on, effort is configurable (`daytrade.analyst_effort`),
+and the request opts into Anthropic's server-side refusal fallback so a
+declined request is re-run on a fallback model automatically. Set
+`ANTHROPIC_API_KEY` to enable it; the model defaults to `claude-opus-5` and
+one plan costs a few cents.
 
-## Configuration
+The system prompt tells the model how the desk works (bracket orders, fixed
+risk, flat by close), asks for company-level catalysts, and makes "no
+trades today" an explicitly acceptable answer. You can read and edit it in
+the same file.
 
-Everything lives in `config.yaml`. The shipped allocation is an example:
+## Journal and review
 
-| Symbol | Weight | Role |
-|--------|--------|------|
-| SCHD | 30% | US dividend-growth stocks |
-| VYM | 15% | US high-dividend-yield stocks |
-| VTI | 25% | Total US market |
-| JEPI | 12% | Covered-call income (monthly payouts) |
-| BND | 15% | US bonds, also the risk-off destination |
-| cash | 3% | Buffer |
+`journal/YYYY-MM-DD.json` records the plan, each entry with its stop and
+target, any halt, and the close with realized P&L per symbol (computed
+from the broker's fill records, so it matches the account). `review`
+aggregates every day:
 
-Key knobs:
+```
+trading days      22   (halted by loss limit: 1)
+trades            41
+win rate          46%
+total P&L         $612.40
+per trade         $14.94
+best / worst      $310.00 / -$248.50
+profit factor     1.31
+```
 
-| Setting | Meaning |
-|---------|---------|
-| `trading.cash_buffer_pct` | Cash kept uninvested |
-| `trading.drift_threshold_pct` | How far above target a holding must be before it is sold |
-| `trading.allow_sells` | `false` turns the agent into a buy-only accumulator |
-| `regime.*` | Benchmark, moving-average length, how much equity to cut in risk-off |
-| `risk.max_order_value` / `max_daily_trade_value` | Hard dollar caps per order and per run |
-| `risk.max_position_weight` | No buy may push a holding above this weight |
-| `risk.max_drawdown_pct` | Pause buying after a loss this large from the 1-year peak |
-| `backtest.*` | Initial deposit, monthly contribution, evaluation cadence |
+A profit factor under 1.0 or a negative per-trade expectancy after a few
+weeks of paper trading is the answer to "does this make money".
 
-The loader rejects configurations that cannot work, for example weights that
-do not sum to 100%, or a risk-off shift that would put the defensive asset
-above the position cap.
+## Running it on a schedule
+
+**cron on any always-on machine** (recommended for the intraday steps;
+times shown for US Eastern):
+
+```
+45 8  * * 1-5  cd /path/to/stock-agent && . .env && python -m stock_agent plan >> logs/agent.log 2>&1
+35 9  * * 1-5  cd /path/to/stock-agent && . .env && python -m stock_agent open --execute >> logs/agent.log 2>&1
+*/10 9-15 * * 1-5  cd /path/to/stock-agent && . .env && python -m stock_agent monitor --execute >> logs/agent.log 2>&1
+52 15 * * 1-5  cd /path/to/stock-agent && . .env && python -m stock_agent close --execute >> logs/agent.log 2>&1
+```
+
+**GitHub Actions**: `.github/workflows/stock-agent.yml` (repo root) runs
+`plan`, `open`, `monitor` and `close` on a weekday schedule using the
+repository secrets `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`,
+`ANTHROPIC_API_KEY` and optionally `ALERT_WEBHOOK_URL`. Scheduled Actions
+can start several minutes late, which matters for the open and the close,
+so treat it as a way to try the cycle, not as production plumbing. The
+workflow runs dry unless the `execute` input is set on a manual trigger or
+you change the schedule steps. Note that the journal is not persisted
+between Actions runs; it is uploaded as an artifact instead.
 
 ## Going live
 
-Live trading needs two deliberate steps, so it cannot happen by accident:
-
 1. `export STOCK_AGENT_LIVE_TRADING=I_UNDERSTAND_THE_RISKS`
-2. pass `--live` on the command line: `python -m stock_agent --live run --execute`
+2. add `--live` to every command: `python -m stock_agent --live open --execute`
 
-Before that, run the paper account for at least a few weeks, check
-`status` and `income` regularly, and read through `stock_agent/risk.py` so
-you know exactly what the caps are. Keep `max_order_value` and
-`max_daily_trade_value` small at first. Money moving *into* the brokerage
-account (your monthly contribution) is still up to you: the agent invests
-whatever cash it finds.
+Neither alone is enough. Before that, run at least a month on paper, keep
+`risk_per_trade_pct` and `max_daily_loss_pct` small, and know that fills
+at the open will be worse than the paper account suggests.
+
+## Long-term ETF portfolio mode
+
+The original dividend/index strategy is still included under
+`python -m stock_agent portfolio run|status|income|backtest`. It uses the
+`targets`, `trading`, `regime`, `risk` and `backtest` sections of
+`config.yaml` and is a far lower-risk way to compound money than day
+trading. Both modes share the same broker account, so do not run both on
+the same account at once.
 
 ## Tests
 
@@ -152,22 +182,24 @@ whatever cash it finds.
 python -m pytest
 ```
 
-The suite runs entirely against an in-memory broker simulator; no network
-or API keys are needed.
+Everything runs against an in-memory broker simulator and a fake Claude
+client. No network, keys or money involved.
 
 ## Layout
 
 ```
 stock_agent/
-  config.py     YAML config + credentials, validation
-  models.py     dataclasses (Account, Position, Trade, RunReport, ...)
-  broker.py     AlpacaBroker (REST) and SimBroker (in-memory)
-  strategy.py   regime filter, target weights, trade planning
-  risk.py       preflight checks, drawdown, hard order limits
-  agent.py      one run: observe -> plan -> limit -> execute -> report
-  backtest.py   historical simulation with contributions
-  reporting.py  status and dividend income reports
-  cli.py        command line entry point
-tests/          pytest suite (no network)
-config.yaml     strategy and risk settings
+  daytrade/
+    scan.py       news + screeners -> screened candidates (ATR, dollar volume, spread)
+    analyst.py    ClaudeAnalyst (structured JSON plan) and RulesAnalyst fallback
+    plan.py       GamePlan/Pick, validation and clamping, risk-based sizing
+    session.py    plan / open / monitor / close commands
+    journal.py    per-day journal and the review statistics
+  broker.py       AlpacaBroker (REST) and SimBroker (in-memory)
+  config.py       config.yaml + credentials, validation
+  models.py       dataclasses
+  agent.py, strategy.py, risk.py, backtest.py, reporting.py   ETF portfolio mode
+  cli.py          command line entry point
+tests/            pytest suite
+config.yaml       all settings
 ```

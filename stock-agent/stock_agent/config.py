@@ -50,12 +50,40 @@ class BacktestConfig:
 
 
 @dataclass(frozen=True)
+class DayTradeConfig:
+    """Settings for the news-driven intraday strategy."""
+
+    max_picks: int = 3                    # positions opened per day
+    risk_per_trade_pct: float = 0.5       # % of equity lost if a stop is hit
+    max_position_pct: float = 20.0        # % of equity in one position
+    max_daily_loss_pct: float = 2.0       # flatten everything and stop for the day
+    min_price: float = 5.0
+    max_price: float = 1000.0
+    min_avg_dollar_volume: float = 20_000_000.0   # 20-day average $ traded per day
+    max_spread_pct: float = 0.3           # bid/ask spread as % of price
+    min_stop_pct: float = 0.75
+    max_stop_pct: float = 4.0
+    min_reward_risk: float = 1.5          # target distance / stop distance
+    allow_short: bool = False
+    entry_delay_minutes: int = 5          # wait this long after the open before entering
+    flatten_minutes_before_close: int = 10
+    news_lookback_hours: int = 18
+    screener_top: int = 25
+    respect_pdt_rule: bool = True         # <$25k accounts: max 3 day trades per 5 days
+    analyst_model: str = "claude-opus-5"
+    analyst_effort: str = "high"
+    blocklist: tuple[str, ...] = ()
+    journal_dir: str = "journal"
+
+
+@dataclass(frozen=True)
 class Config:
     targets: dict[str, float]
     trading: TradingConfig = field(default_factory=TradingConfig)
     regime: RegimeConfig = field(default_factory=RegimeConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
+    daytrade: DayTradeConfig = field(default_factory=DayTradeConfig)
 
     @property
     def cash_weight(self) -> float:
@@ -79,7 +107,30 @@ def _build(dc: type, raw: dict[str, Any] | None, section: str):
     return dc(**raw)
 
 
+def _parse_daytrade(raw: dict[str, Any] | None) -> DayTradeConfig:
+    raw = dict(raw or {})
+    if "blocklist" in raw:
+        raw["blocklist"] = tuple(str(x).upper() for x in (raw["blocklist"] or []))
+    dt = _build(DayTradeConfig, raw, "daytrade")
+    if dt.max_picks < 1:
+        raise ConfigError("daytrade.max_picks must be at least 1")
+    if not 0 < dt.risk_per_trade_pct <= 5:
+        raise ConfigError("daytrade.risk_per_trade_pct must be between 0 and 5")
+    if not 0 < dt.max_position_pct <= 100:
+        raise ConfigError("daytrade.max_position_pct must be between 0 and 100")
+    if not 0 < dt.max_daily_loss_pct <= 25:
+        raise ConfigError("daytrade.max_daily_loss_pct must be between 0 and 25")
+    if dt.min_stop_pct <= 0 or dt.max_stop_pct < dt.min_stop_pct:
+        raise ConfigError("daytrade stop bounds must satisfy 0 < min_stop_pct <= max_stop_pct")
+    if dt.min_reward_risk < 1.0:
+        raise ConfigError("daytrade.min_reward_risk must be at least 1.0")
+    if dt.analyst_effort not in ("low", "medium", "high", "xhigh", "max"):
+        raise ConfigError("daytrade.analyst_effort must be one of low, medium, high, xhigh, max")
+    return dt
+
+
 def parse_config(raw: dict[str, Any]) -> Config:
+    daytrade = _parse_daytrade(raw.get("daytrade"))
     targets_raw = raw.get("targets")
     if not isinstance(targets_raw, dict) or not targets_raw:
         raise ConfigError("'targets' must be a non-empty mapping of symbol -> weight")
@@ -137,7 +188,7 @@ def parse_config(raw: dict[str, Any]) -> Config:
                 f"risk.max_position_weight {risk.max_position_weight:.0%}; raise the cap or lower the shift"
             )
 
-    return Config(targets=targets, trading=trading, regime=regime, risk=risk, backtest=backtest)
+    return Config(targets=targets, trading=trading, regime=regime, risk=risk, backtest=backtest, daytrade=daytrade)
 
 
 def load_config(path: str | Path) -> Config:
@@ -183,3 +234,9 @@ def load_credentials(env: dict[str, str] | None = None) -> Credentials:
     live = env.get("STOCK_AGENT_LIVE_TRADING", "").strip() == LIVE_TRADING_PHRASE
     webhook = env.get("ALERT_WEBHOOK_URL", "").strip() or None
     return Credentials(api_key=api_key, secret_key=secret_key, live=live, alert_webhook_url=webhook)
+
+
+def has_anthropic_credentials(env: dict[str, str] | None = None) -> bool:
+    """True when the Anthropic SDK will be able to authenticate from the environment."""
+    env = env if env is not None else dict(os.environ)
+    return bool(env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN"))
