@@ -1,5 +1,7 @@
 # Juniper Switch Configuration
 
+> Looking for the stock investment agent? See [`stock-agent/README.md`](stock-agent/README.md).
+
 This repository contains a baseline configuration for Juniper EX series switches suitable for enterprise deployments.
 
 ## Configuration Overview

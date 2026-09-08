@@ -1,0 +1,12 @@
+[project]
+name = "stock-agent"
+version = "0.1.0"
+description = "Rules-based dividend/index investment agent on the Alpaca API"
+requires-python = ">=3.10"
+dependencies = ["requests>=2.31", "PyYAML>=6.0"]
+
+[project.scripts]
+stock-agent = "stock_agent.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

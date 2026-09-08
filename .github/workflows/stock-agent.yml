@@ -1,0 +1,55 @@
+name: stock-agent
+
+on:
+  schedule:
+    # Weekdays at 14:35 UTC (10:35 ET during daylight time, 9:35 ET in winter).
+    # The agent itself checks the market clock and does nothing when closed.
+    - cron: "35 14 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      execute:
+        description: "Submit orders (paper account). Leave false for a dry run."
+        type: boolean
+        default: false
+      command:
+        description: "Command to run: run, status, income, check"
+        type: choice
+        default: run
+        options: [run, status, income, check]
+
+permissions:
+  contents: read
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: stock-agent
+    env:
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+      ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+      # Live trading is intentionally NOT wired up here. Paper only.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Run agent
+        run: |
+          CMD="${{ github.event.inputs.command || 'run' }}"
+          if [ "$CMD" = "run" ] && [ "${{ github.event.inputs.execute }}" = "true" ]; then
+            python -m stock_agent run --execute
+          else
+            python -m stock_agent "$CMD"
+          fi
+      - name: Keep trade log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade-log-${{ github.run_id }}
+          path: stock-agent/logs/
+          if-no-files-found: ignore
