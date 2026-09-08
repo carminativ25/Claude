@@ -271,7 +271,7 @@ def simulate_day(cfg: Config, day: date, watch: list[tuple[str, str]], minutes: 
             if isinstance(result, NoSignal):
                 if result.key and result.key not in ("no breakout", "range forming"):
                     last_reason[sym] = result.key
-                elif sym not in last_reason:
+                elif sym not in last_reason or last_reason[sym] == "range forming":
                     last_reason[sym] = result.key or result.reason
                 if result.key == "low relative volume" and result.rvol is not None:
                     diag.rvol_at_breakout.append(result.rvol)
