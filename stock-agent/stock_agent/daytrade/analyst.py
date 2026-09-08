@@ -53,8 +53,9 @@ class RulesAnalyst:
         scored.sort(key=lambda t: -t[0])
         picks = []
         for score, c in scored[: dt.max_watchlist]:
-            direction = "long" if c.gap_pct > 0 or not dt.allow_short else "short"
-            if c.gap_pct < 0 and not dt.allow_short:
+            with_gap = "long" if c.gap_pct > 0 else "short"
+            direction = with_gap if dt.mode == "breakout" else ("short" if with_gap == "long" else "long")
+            if direction == "short" and not dt.allow_short:
                 continue
             picks.append(
                 Pick(

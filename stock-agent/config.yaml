@@ -25,6 +25,7 @@ daytrade:
   news_lookback_hours: 18        # headlines since yesterday afternoon
   screener_top: 25               # top gainers / losers / most-active to consider
   max_watchlist: 8               # names watched for a breakout each day
+  mode: breakout                 # breakout = trade with the gap; fade = against it (gap-ups need allow_short)
   blocklist: []                  # symbols never to trade, e.g. [TSLA, GME]
 
   # --- opening range breakout entry (the same rules run live and in the backtest) ---

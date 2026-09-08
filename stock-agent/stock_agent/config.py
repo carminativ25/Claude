@@ -84,6 +84,7 @@ class DayTradeConfig:
     require_vwap_confirmation: bool = True
     min_gap_pct: float = 2.0              # watchlist: open vs. previous close, in percent
     min_gap_atr: float = 0.0              # watchlist: gap must also be at least this many daily ATRs (0 = off)
+    mode: str = "breakout"                # breakout: trade with the gap; fade: trade against it (needs allow_short for gap-ups)
     poll_seconds: int = 60                # live loop interval
     data_feed: str = "iex"                # iex (free) or sip (paid Alpaca data plan)
     slippage_bps: float = 5.0             # backtest fill penalty per side, basis points
@@ -133,6 +134,8 @@ def _parse_daytrade(raw: dict[str, Any] | None) -> DayTradeConfig:
         raise ConfigError("daytrade.reward_risk must be at least 1.0")
     if dt.data_feed not in ("iex", "sip"):
         raise ConfigError("daytrade.data_feed must be iex or sip")
+    if dt.mode not in ("breakout", "fade"):
+        raise ConfigError("daytrade.mode must be breakout or fade")
     if dt.max_picks < 1:
         raise ConfigError("daytrade.max_picks must be at least 1")
     if not 0 < dt.risk_per_trade_pct <= 5:

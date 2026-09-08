@@ -155,10 +155,12 @@ def build_watchlist(cfg: Config, day: date, daily: dict[str, list[Bar]]) -> tupl
             atr_pct = sum(trs) / len(trs) / prev.close * 100.0 if trs and prev.close else 0.0
             if atr_pct <= 0 or abs(gap) < dt.min_gap_atr * atr_pct:
                 continue
-        if gap < 0 and not dt.allow_short:
+        with_gap = "long" if gap > 0 else "short"
+        direction = with_gap if dt.mode == "breakout" else ("short" if with_gap == "long" else "long")
+        if direction == "short" and not dt.allow_short:
             continue
         avg_vol[sym] = sum(b.volume for b in hist) / len(hist)
-        scored.append((abs(gap), sym, "long" if gap > 0 else "short"))
+        scored.append((abs(gap), sym, direction))
     scored.sort(reverse=True)
     return [(sym, direction) for _, sym, direction in scored[: dt.max_watchlist]], avg_vol
 

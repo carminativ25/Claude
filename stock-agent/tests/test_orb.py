@@ -207,3 +207,11 @@ def test_min_gap_atr_filters_normal_volatility():
     d = daily({"AAA": 4.0})
     assert build_watchlist(cfg(min_gap_atr=1.5), DAY, d)[0] == [("AAA", "long")]
     assert build_watchlist(cfg(min_gap_atr=3.0), DAY, d)[0] == []
+
+
+def test_fade_mode_inverts_direction():
+    d = daily({"AAA": 5.0, "DDD": -6.0})
+    watch, _ = build_watchlist(cfg(mode="fade", allow_short=True, max_watchlist=3), DAY, d)
+    assert watch == [("DDD", "long"), ("AAA", "short")]
+    watch, _ = build_watchlist(cfg(mode="fade", allow_short=False, max_watchlist=3), DAY, d)
+    assert watch == [("DDD", "long")]   # gap-ups need a short, which is disabled
