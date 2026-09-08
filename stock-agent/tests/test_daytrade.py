@@ -10,7 +10,9 @@ from stock_agent.daytrade import journal
 from stock_agent.daytrade.analyst import ClaudeAnalyst, RulesAnalyst, build_user_prompt
 from stock_agent.daytrade.plan import Candidate, GamePlan, Pick, load_plan, save_plan, size_position, validate_picks
 from stock_agent.daytrade.scan import average_dollar_volume, average_true_range_pct, scan
-from stock_agent.daytrade.session import close_day, monitor, open_day, plan_day
+from stock_agent.daytrade.orb import session_open
+from stock_agent.daytrade.session import close_day, monitor, plan_day, trade_once
+from stock_agent.models import MinuteBar
 from stock_agent.models import Asset, Bar, Mover, NewsItem, Quote
 
 TODAY = date(2026, 9, 8)
@@ -99,46 +101,43 @@ def cands():
     }
 
 
-def test_validate_picks_clamps_and_rejects(tmp_path):
-    cfg = dcfg(tmp_path, max_picks=2)
+def test_validate_picks_filters(tmp_path):
+    cfg = dcfg(tmp_path, max_watchlist=2)
     picks = [
-        Pick("ACME", "long", "c", "t", 0.9, stop_pct=0.1, target_pct=0.1),     # stop too tight, target too close
-        Pick("BIGCO", "short", "c", "t", 0.8, 2.0, 5.0),                        # shorting disabled
-        Pick("NOPE", "long", "c", "t", 0.7, 2.0, 5.0),                          # not a candidate
-        Pick("ACME", "long", "c", "t", 0.5, 2.0, 5.0),                          # duplicate
+        Pick("BIGCO", "short", "c", "t", 0.8),   # shorting disabled
+        Pick("NOPE", "long", "c", "t", 0.7),     # not a candidate
+        Pick("ACME", "long", "c", "t", 0.5),
+        Pick("ACME", "long", "c", "t", 0.4),     # duplicate
     ]
     ok, rejected = validate_picks(cfg, picks, cands())
     assert [p.symbol for p in ok] == ["ACME"]
-    assert ok[0].stop_pct == 0.75 and ok[0].target_pct >= 0.75 * 1.5
     assert {r["symbol"] for r in rejected} == {"BIGCO", "NOPE"}
 
 
 def test_validate_picks_respects_max_and_confidence_order(tmp_path):
-    cfg = dcfg(tmp_path, max_picks=1)
-    picks = [Pick("BIGCO", "long", "c", "t", 0.6, 1.0, 2.0), Pick("ACME", "long", "c", "t", 0.9, 1.0, 2.0)]
+    cfg = dcfg(tmp_path, max_watchlist=1)
+    picks = [Pick("BIGCO", "long", "c", "t", 0.6), Pick("ACME", "long", "c", "t", 0.9)]
     ok, _ = validate_picks(cfg, picks, cands())
     assert [p.symbol for p in ok] == ["ACME"]
 
 
 def test_size_position_by_risk(tmp_path):
     cfg = dcfg(tmp_path, risk_per_trade_pct=1.0, max_position_pct=50.0)
-    pick = Pick("ACME", "long", "c", "t", 0.9, stop_pct=2.0, target_pct=4.0)
-    sized = size_position(cfg, pick, entry=50.0, equity=10_000, cash=10_000)
+    sized = size_position(cfg, "ACME", "buy", entry=50.0, stop=49.0, target=52.0, equity=10_000, cash=10_000)
     # risk $100, stop distance $1 -> 100 shares, $5000 = 50% cap
     assert sized.qty == 100 and sized.stop == 49.0 and sized.target == 52.0 and sized.risk_dollars == 100.0
 
 
 def test_size_position_caps_by_weight_and_cash(tmp_path):
     cfg = dcfg(tmp_path, risk_per_trade_pct=5.0, max_position_pct=10.0)
-    pick = Pick("ACME", "long", "c", "t", 0.9, 1.0, 2.0)
-    assert size_position(cfg, pick, 50.0, 10_000, 10_000).qty == 20      # 10% of 10k / 50
-    assert size_position(cfg, pick, 50.0, 10_000, 600).qty == 12         # cash-bound
-    assert size_position(cfg, pick, 5_000.0, 10_000, 10_000) is None    # less than one share
+    assert size_position(cfg, "ACME", "buy", 50.0, 49.5, 51.0, 10_000, 10_000).qty == 20   # 10% of 10k / 50
+    assert size_position(cfg, "ACME", "buy", 50.0, 49.5, 51.0, 10_000, 600).qty == 12      # cash-bound
+    assert size_position(cfg, "ACME", "buy", 5_000.0, 4_950.0, 5_100.0, 10_000, 10_000) is None
 
 
 def test_plan_round_trip(tmp_path):
     cfg = dcfg(tmp_path)
-    plan = GamePlan(day="2026-09-08", market_summary="quiet", picks=[Pick("ACME", "long", "c", "t", 0.8, 1.0, 2.0)], analyst="rules")
+    plan = GamePlan(day="2026-09-08", market_summary="quiet", picks=[Pick("ACME", "long", "c", "t", 0.8)], analyst="rules")
     save_plan(cfg, plan)
     loaded = load_plan(cfg, "2026-09-08")
     assert loaded.picks[0].symbol == "ACME" and loaded.analyst == "rules"
@@ -149,9 +148,8 @@ def test_plan_round_trip(tmp_path):
 def test_rules_analyst_picks_news_gappers(tmp_path):
     cfg = dcfg(tmp_path)
     plan = RulesAnalyst().propose(cfg, TODAY, cands(), [])
-    assert [p.symbol for p in plan.picks] == ["ACME"]      # BIGCO has no headlines
-    p = plan.picks[0]
-    assert p.stop_pct == 3.0 and p.target_pct == 6.0        # 0.75 * ATR 4%, 2:1
+    assert [p.symbol for p in plan.picks] == ["ACME"]      # BIGCO gap 0.5% is below min_gap_pct
+    assert plan.picks[0].direction == "long" and "beat" in plan.picks[0].catalyst
 
 
 class FakeMessages:
@@ -178,7 +176,7 @@ def test_claude_analyst_parses_structured_plan(tmp_path):
     cfg = dcfg(tmp_path)
     payload = {
         "market_summary": "Earnings-driven morning.",
-        "picks": [{"symbol": "acme", "direction": "long", "catalyst": "beat", "thesis": "guidance up", "confidence": 0.7, "stop_pct": 2.0, "target_pct": 4.0}],
+        "picks": [{"symbol": "acme", "direction": "long", "catalyst": "beat", "thesis": "guidance up", "confidence": 0.7}],
         "avoid": [{"symbol": "BIGCO", "reason": "no catalyst"}],
     }
     client, msgs = fake_client(text_response(payload))
@@ -217,7 +215,7 @@ def test_prompt_mentions_limits_and_headlines(tmp_path):
     cfg = dcfg(tmp_path, max_picks=2)
     news = [NewsItem("ACME beats", "big", ("ACME",), "src", "2026-09-08T11:00:00Z")]
     text = build_user_prompt(cfg, TODAY, cands(), news)
-    assert "at most 2 positions" in text and "ACME beats" in text and "NOT allowed" in text
+    assert "at most 2 positions" in text and "ACME beats" in text and "NOT allowed" in text and "opening range breakout" in text
 
 
 # ---------------------------------------------------------------- session
@@ -231,59 +229,95 @@ def test_plan_day_end_to_end(tmp_path):
     assert events[0]["kind"] == "plan" and events[0]["picks"] == ["ACME"]
 
 
-def test_open_day_dry_run_then_execute(tmp_path):
-    cfg = dcfg(tmp_path, risk_per_trade_pct=1.0)
-    broker = market_broker(cash=50_000)
-    plan_day(cfg, broker, RulesAnalyst(), today=TODAY)
-    report = open_day(cfg, broker, dry_run=True, today=TODAY)
-    assert report.halted_reason is None and broker.brackets == []
-    assert any(line.startswith("BUY  ACME") for line in report.lines)
+def acme_session(breakout=True, after="flat"):
+    """ACME minute bars: 15-minute range 51.5-52.5, breakout at minute 20 if requested."""
+    bars = []
+    t0 = session_open(TODAY)
+    for i in range(60):
+        t = t0 + timedelta(minutes=i)
+        if i < 15:
+            o, h, l, c = 52.0, 52.5, 51.5, 52.0
+        elif i == 20 and breakout:
+            o, h, l, c = 52.0, 52.9, 52.0, 52.8
+        else:
+            px = 52.0 if not breakout or i < 20 else 52.8
+            o = h = l = c = px
+        bars.append(MinuteBar(t, o, h, l, c, 400_000))
+    return bars
 
-    report = open_day(cfg, broker, dry_run=False, today=TODAY)
+
+def armed(tmp_path, cash=50_000, breakout=True, **cfg_overrides):
+    """Broker + config + plan ready for the trade command, with the clock 21 minutes into the session."""
+    cfg = dcfg(tmp_path, risk_per_trade_pct=1.0, min_relative_volume=1.0, **cfg_overrides)
+    broker = market_broker(cash=cash)
+    plan_day(cfg, broker, RulesAnalyst(), today=TODAY)
+    broker.minute_bars = {"ACME": acme_session(breakout)}
+    broker.clock_timestamp = (session_open(TODAY) + timedelta(minutes=21)).isoformat()
+    broker.quotes["ACME"] = Quote("ACME", 52.80, 52.85)
+    broker.set_prices({"ACME": 52.85})
+    return cfg, broker
+
+
+def test_trade_waits_for_breakout(tmp_path):
+    cfg, broker = armed(tmp_path, breakout=False)
+    report = trade_once(cfg, broker, dry_run=False, today=TODAY)
+    assert report.halted_reason is None and broker.brackets == []
+    assert any("no breakout yet" in line for line in report.lines)
+
+
+def test_trade_dry_run_then_execute(tmp_path):
+    cfg, broker = armed(tmp_path)
+    report = trade_once(cfg, broker, dry_run=True, today=TODAY)
+    assert broker.brackets == [] and any(line.startswith("BUY  ACME") for line in report.lines)
+
+    report = trade_once(cfg, broker, dry_run=False, today=TODAY)
     assert len(report.orders) == 1
     br = broker.brackets[0]
-    # entry at ask 52.05, stop 3% -> 1.5615 per share, risk $500 -> 320 shares, capped by 20% of equity (10k / 52.05 = 192)
-    assert br["symbol"] == "ACME" and br["qty"] == 192
-    assert br["stop_loss"] == pytest.approx(52.05 * 0.97, abs=0.01)
-    assert br["take_profit"] == pytest.approx(52.05 * 1.06, abs=0.01)
-    # second call must not double up
-    again = open_day(cfg, broker, dry_run=False, today=TODAY)
-    assert again.orders == [] and any("already has a position" in line for line in again.lines)
+    # entry at ask 52.85, stop at range low 51.5 -> $1.35 risk/share; 1% of 50k = $500 -> 370 shares, capped by 20% (10k / 52.85 = 189)
+    assert br["symbol"] == "ACME" and br["qty"] == 189
+    assert br["stop_loss"] == pytest.approx(51.5)
+    assert br["take_profit"] == pytest.approx(52.85 + 2 * (52.85 - 51.5), abs=0.01)
+    # a second pass must not re-enter
+    again = trade_once(cfg, broker, dry_run=False, today=TODAY)
+    assert again.orders == [] and any("already handled" in line for line in again.lines)
 
 
-def test_open_day_requires_plan_and_open_market(tmp_path):
+def test_trade_requires_plan_and_open_market(tmp_path):
     cfg = dcfg(tmp_path)
     broker = market_broker()
-    assert "no game plan" in open_day(cfg, broker, dry_run=False, today=TODAY).halted_reason
-    plan_day(cfg, broker, RulesAnalyst(), today=TODAY)
+    assert "no game plan" in trade_once(cfg, broker, dry_run=False, today=TODAY).halted_reason
+    cfg, broker = armed(tmp_path)
     broker.market_open = False
-    assert "market is closed" in open_day(cfg, broker, dry_run=False, today=TODAY).halted_reason
+    assert "market is closed" in trade_once(cfg, broker, dry_run=False, today=TODAY).halted_reason
     assert broker.brackets == []
 
 
-def test_open_day_pdt_rule_limits_small_accounts(tmp_path):
-    cfg = dcfg(tmp_path)
-    broker = market_broker(cash=10_000)
+def test_trade_pdt_rule_limits_small_accounts(tmp_path):
+    cfg, broker = armed(tmp_path, cash=10_000)
     broker.daytrade_count = 3
-    plan_day(cfg, broker, RulesAnalyst(), today=TODAY)
-    report = open_day(cfg, broker, dry_run=False, today=TODAY)
+    report = trade_once(cfg, broker, dry_run=False, today=TODAY)
     assert broker.brackets == [] and any("PDT rule" in w for w in report.warnings)
 
 
-def test_open_day_blocked_after_loss_limit(tmp_path):
-    cfg = dcfg(tmp_path, max_daily_loss_pct=2.0)
-    broker = market_broker(cash=50_000)
-    plan_day(cfg, broker, RulesAnalyst(), today=TODAY)
+def test_trade_blocked_after_loss_limit(tmp_path):
+    cfg, broker = armed(tmp_path, max_daily_loss_pct=2.0)
     broker.last_equity = 52_000  # down 3.8% already
-    report = open_day(cfg, broker, dry_run=False, today=TODAY)
+    report = trade_once(cfg, broker, dry_run=False, today=TODAY)
     assert "already down" in report.halted_reason and broker.brackets == []
 
 
+def test_trade_final_rejections_are_remembered(tmp_path):
+    cfg, broker = armed(tmp_path, max_stop_pct=1.0)  # 1.9% range is too wide for a 1% stop
+    report = trade_once(cfg, broker, dry_run=False, today=TODAY)
+    assert any("too wide" in line for line in report.lines)
+    assert any(e["kind"] == "done" for e in journal.load_day(cfg, TODAY)["events"])
+    again = trade_once(cfg, broker, dry_run=False, today=TODAY)
+    assert any("already handled" in line for line in again.lines)
+
+
 def test_monitor_flattens_on_loss_limit_and_halts_reentry(tmp_path):
-    cfg = dcfg(tmp_path, max_daily_loss_pct=2.0)
-    broker = market_broker(cash=50_000)
-    plan_day(cfg, broker, RulesAnalyst(), today=TODAY)
-    open_day(cfg, broker, dry_run=False, today=TODAY)
+    cfg, broker = armed(tmp_path, max_daily_loss_pct=2.0)
+    trade_once(cfg, broker, dry_run=False, today=TODAY)
     broker.set_prices({"ACME": 45.0})  # position tanks
     broker.last_equity = 50_000
     report = monitor(cfg, broker, dry_run=False, today=TODAY)
@@ -292,14 +326,12 @@ def test_monitor_flattens_on_loss_limit_and_halts_reentry(tmp_path):
     kinds = [e["kind"] for e in journal.load_day(cfg, TODAY)["events"]]
     assert "halt" in kinds and "close" in kinds
     # the halt sticks for the rest of the day
-    assert "halted earlier today" in open_day(cfg, broker, dry_run=False, today=TODAY).halted_reason
+    assert "halted earlier today" in trade_once(cfg, broker, dry_run=False, today=TODAY).halted_reason
 
 
 def test_monitor_flattens_before_close_only(tmp_path):
-    cfg = dcfg(tmp_path, flatten_minutes_before_close=10)
-    broker = market_broker(cash=50_000)
-    plan_day(cfg, broker, RulesAnalyst(), today=TODAY)
-    open_day(cfg, broker, dry_run=False, today=TODAY)
+    cfg, broker = armed(tmp_path, flatten_minutes_before_close=10)
+    trade_once(cfg, broker, dry_run=False, today=TODAY)
     close_at = datetime(2026, 9, 8, 20, 0, tzinfo=timezone.utc)
     broker.next_close = close_at.isoformat()
     broker.clock_timestamp = (close_at - timedelta(hours=2)).isoformat()
@@ -311,15 +343,13 @@ def test_monitor_flattens_before_close_only(tmp_path):
 
 
 def test_close_day_records_pnl_and_review(tmp_path):
-    cfg = dcfg(tmp_path)
-    broker = market_broker(cash=50_000)
-    plan_day(cfg, broker, RulesAnalyst(), today=TODAY)
-    open_day(cfg, broker, dry_run=False, today=TODAY)
+    cfg, broker = armed(tmp_path)
+    trade_once(cfg, broker, dry_run=False, today=TODAY)
     broker.set_prices({"ACME": 54.0})
     report = close_day(cfg, broker, dry_run=False, today=TODAY)
     assert broker.get_positions() == []
     qty = broker.brackets[0]["qty"]
-    expected = qty * (54.0 - 52.0)  # SimBroker fills at last price (52.0), not the ask
+    expected = qty * (54.0 - 52.85)  # SimBroker fills at the last price
     close_event = [e for e in journal.load_day(cfg, TODAY)["events"] if e["kind"] == "close"][-1]
     assert close_event["pnl_by_symbol"]["ACME"] == pytest.approx(expected)
     assert f"{expected:+,.2f}" in report.summary()
@@ -336,3 +366,22 @@ def test_daytrade_config_validation():
         make_config(daytrade={"analyst_effort": "turbo"})
     cfg = make_config(daytrade={"blocklist": ["tsla"]})
     assert cfg.daytrade.blocklist == ("TSLA",)
+
+
+def test_trade_loop_polls_then_flattens(tmp_path):
+    from stock_agent.daytrade.session import trade_loop
+
+    cfg, broker = armed(tmp_path, flatten_minutes_before_close=10, poll_seconds=1)
+    close_at = session_open(TODAY) + timedelta(hours=6, minutes=30)
+    broker.next_close = close_at.isoformat()
+    clock_steps = iter([close_at - timedelta(minutes=5)])
+    slept = []
+
+    def sleep(seconds):
+        slept.append(seconds)
+        broker.clock_timestamp = next(clock_steps).isoformat()
+
+    reports = trade_loop(cfg, broker, dry_run=False, live=False, today=TODAY, sleep=sleep)
+    assert [r.command for r in reports] == ["trade", "monitor"]
+    assert len(broker.brackets) == 1 and broker.get_positions() == []
+    assert slept == [1]

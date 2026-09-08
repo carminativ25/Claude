@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 
@@ -11,7 +12,8 @@ from ..config import Config
 from ..models import Order
 from . import journal
 from .analyst import Analyst
-from .plan import GamePlan, Sized, load_plan, save_plan, size_position, validate_picks
+from .orb import NoSignal, evaluate_breakout, session_open
+from .plan import GamePlan, load_plan, save_plan, size_position, validate_picks
 from .scan import scan
 
 log = logging.getLogger(__name__)
@@ -88,22 +90,47 @@ def plan_day(cfg: Config, broker: Broker, analyst: Analyst, *, today: date | Non
 
 
 # ---------------------------------------------------------------------------
-# open
+# trade: opening range breakout entries
 # ---------------------------------------------------------------------------
-def open_day(cfg: Config, broker: Broker, *, dry_run: bool = True, live: bool = False, today: date | None = None, plan: GamePlan | None = None) -> SessionReport:
+def _avg_daily_volumes(broker: Broker, symbols: list[str], today: date) -> dict[str, float]:
+    bars = broker.get_daily_bars(symbols, today - timedelta(days=45), today - timedelta(days=1)) if symbols else {}
+    out = {}
+    for sym, series in bars.items():
+        window = series[-20:]
+        out[sym] = sum(b.volume for b in window) / len(window) if window else 0.0
+    return out
+
+
+def _attempted_today(cfg: Config, day: date) -> set[str]:
+    return {e["symbol"] for e in journal.load_day(cfg, day).get("events", []) if e.get("kind") in ("entry", "done")}
+
+
+def trade_once(
+    cfg: Config,
+    broker: Broker,
+    *,
+    dry_run: bool = True,
+    live: bool = False,
+    today: date | None = None,
+    now: datetime | None = None,
+    plan: GamePlan | None = None,
+    avg_volumes: dict[str, float] | None = None,
+) -> SessionReport:
+    """One pass over the watchlist: enter any symbol that has just broken out of its opening range."""
     today = today or date.today()
     dt = cfg.daytrade
-    report = SessionReport(command="open", dry_run=dry_run, live=live)
+    report = SessionReport(command="trade", dry_run=dry_run, live=live)
     account = broker.get_account()
     clock = broker.get_clock()
     report.equity = account.equity
+    now = now or _parse_ts(clock.timestamp) or datetime.now(timezone.utc)
 
     plan = plan or load_plan(cfg, today)
     if plan is None:
         report.halted_reason = f"no game plan for {today}; run 'plan' first"
         return report
     if not plan.picks:
-        report.lines.append("game plan has no picks; nothing to open")
+        report.lines.append("watchlist is empty; nothing to do")
         return report
     if account.trading_blocked or account.account_blocked or account.status.upper() not in ("", "ACTIVE"):
         report.halted_reason = "account is blocked or inactive"
@@ -118,35 +145,59 @@ def open_day(cfg: Config, broker: Broker, *, dry_run: bool = True, live: bool = 
         report.halted_reason = f"already down {daily_loss_pct(account.equity, account.last_equity):.2f}% today"
         return report
 
-    already = {p.symbol for p in broker.get_positions()} | {o.symbol for o in broker.get_open_orders()}
-    picks = list(plan.picks)
+    positions = broker.get_positions()
+    open_orders = broker.get_open_orders()
+    held = {p.symbol for p in positions} | {o.symbol for o in open_orders}
+    attempted = _attempted_today(cfg, today)
+    slots = dt.max_picks - len({p.symbol for p in positions} | {e for e in attempted})
     if dt.respect_pdt_rule and account.equity < PDT_EQUITY_THRESHOLD:
-        allowed = max(0, PDT_MAX_DAY_TRADES - account.daytrade_count)
-        if allowed < len(picks):
-            report.warnings.append(f"PDT rule: equity under $25k and {account.daytrade_count} day trades used; limiting to {allowed} new position(s)")
-            picks = picks[:allowed]
+        pdt_slots = max(0, PDT_MAX_DAY_TRADES - account.daytrade_count - len(positions))
+        if pdt_slots < slots:
+            report.warnings.append(f"PDT rule: equity under $25k and {account.daytrade_count} day trades used; {pdt_slots} new position(s) allowed")
+            slots = pdt_slots
+    if slots <= 0:
+        report.lines.append("no free position slots today")
+        return report
 
-    quotes = broker.get_latest_quotes([p.symbol for p in picks]) if picks else {}
+    watch = [p for p in plan.picks if p.symbol not in held and p.symbol not in attempted]
+    if not watch:
+        report.lines.append("every watchlist symbol is already handled today")
+        return report
+    symbols = [p.symbol for p in watch]
+    avg_volumes = avg_volumes or _avg_daily_volumes(broker, symbols, today)
+    bars = broker.get_minute_bars(symbols, session_open(today), now)
+    quotes = None
     cash = account.cash
-    for pick in picks:
-        if pick.symbol in already:
-            report.lines.append(f"skip {pick.symbol}: already has a position or open order")
+
+    for pick in watch:
+        if slots <= 0:
+            break
+        result = evaluate_breakout(cfg, pick.symbol, bars.get(pick.symbol, []), today, avg_volumes.get(pick.symbol, 0.0), pick.direction, now)
+        if isinstance(result, NoSignal):
+            report.lines.append(f"  {pick.symbol:6} {result.reason}")
+            if result.final and not dry_run:
+                journal.record(cfg, today, "done", {"symbol": pick.symbol, "reason": result.reason})
             continue
+        if quotes is None:
+            quotes = broker.get_latest_quotes(symbols)
         quote = quotes.get(pick.symbol)
-        if quote is None or quote.ask <= 0:
-            report.lines.append(f"skip {pick.symbol}: no live quote")
-            continue
-        if quote.spread_pct > dt.max_spread_pct:
-            report.lines.append(f"skip {pick.symbol}: spread {quote.spread_pct:.2f}% too wide at the open")
-            continue
-        entry = quote.ask if pick.direction == "long" else quote.bid
-        sized = size_position(cfg, pick, entry, account.equity, cash)
+        entry = result.entry
+        if quote is not None and quote.ask > 0 and quote.bid > 0:
+            if quote.spread_pct > dt.max_spread_pct:
+                report.lines.append(f"  {pick.symbol:6} breakout but spread {quote.spread_pct:.2f}% too wide")
+                continue
+            entry = quote.ask if pick.direction == "long" else quote.bid
+        # the stop stays at the range boundary; the target is measured from the price we actually pay
+        target = entry + dt.reward_risk * (entry - result.stop) if pick.direction == "long" else entry - dt.reward_risk * (result.stop - entry)
+        sized = size_position(cfg, pick.symbol, result.side, entry, result.stop, target, account.equity, cash)
         if sized is None:
-            report.lines.append(f"skip {pick.symbol}: position would be smaller than one share")
+            report.lines.append(f"  {pick.symbol:6} breakout but position would be under one share")
+            if not dry_run:
+                journal.record(cfg, today, "done", {"symbol": pick.symbol, "reason": "too small"})
             continue
-        cash -= sized.qty * sized.entry
         report.lines.append(
-            f"{sized.side.upper():4} {sized.symbol:6} {sized.qty:>5} @ ~{sized.entry:.2f}  stop {sized.stop:.2f}  target {sized.target:.2f}  risk ${sized.risk_dollars:,.2f}"
+            f"{sized.side.upper():4} {sized.symbol:6} {sized.qty:>5} @ ~{sized.entry:.2f}  stop {sized.stop:.2f}  target {sized.target:.2f}  "
+            f"range {result.range_low:.2f}-{result.range_high:.2f}  rvol {result.rvol:.1f}x  vwap {result.vwap:.2f}  risk ${sized.risk_dollars:,.2f}"
         )
         if dry_run:
             continue
@@ -155,11 +206,42 @@ def open_day(cfg: Config, broker: Broker, *, dry_run: bool = True, live: bool = 
         except BrokerError as exc:
             report.warnings.append(f"{sized.symbol}: broker rejected order: {exc}")
             continue
+        cash -= sized.qty * sized.entry
+        slots -= 1
         report.orders.append(order)
-        journal.record(cfg, today, "entry", {"symbol": sized.symbol, "side": sized.side, "qty": sized.qty, "entry": sized.entry, "stop": sized.stop, "target": sized.target, "order_id": order.id, "catalyst": pick.catalyst})
-    if not dry_run:
+        journal.record(cfg, today, "entry", {
+            "symbol": sized.symbol, "side": sized.side, "qty": sized.qty, "entry": sized.entry, "stop": sized.stop, "target": sized.target,
+            "range_high": result.range_high, "range_low": result.range_low, "rvol": result.rvol, "vwap": result.vwap,
+            "order_id": order.id, "catalyst": pick.catalyst,
+        })
+    if not dry_run and report.orders:
         report.lines.append(f"submitted {len(report.orders)} bracket order(s)")
     return report
+
+
+def trade_loop(cfg: Config, broker: Broker, *, dry_run: bool, live: bool, today: date | None = None, on_report=None, sleep=time.sleep) -> list[SessionReport]:
+    """Poll for breakouts during the entry window, then keep enforcing the loss limit until flat at the close."""
+    today = today or date.today()
+    reports: list[SessionReport] = []
+    plan = load_plan(cfg, today)
+    avg_volumes = _avg_daily_volumes(broker, [p.symbol for p in plan.picks], today) if plan and plan.picks else {}
+    window_end = session_open(today) + timedelta(minutes=cfg.daytrade.entry_window_minutes)
+    while True:
+        clock = broker.get_clock()
+        now = _parse_ts(clock.timestamp) or datetime.now(timezone.utc)
+        if now < window_end:
+            rep = trade_once(cfg, broker, dry_run=dry_run, live=live, today=today, now=now, plan=plan, avg_volumes=avg_volumes)
+        else:
+            rep = monitor(cfg, broker, dry_run=dry_run, live=live, today=today, now=now)
+        reports.append(rep)
+        if on_report:
+            on_report(rep)
+        if rep.halted_reason and "loss limit" in rep.halted_reason:
+            break
+        if not clock.is_open or any("end of day" in line for line in rep.lines):
+            break
+        sleep(cfg.daytrade.poll_seconds)
+    return reports
 
 
 # ---------------------------------------------------------------------------

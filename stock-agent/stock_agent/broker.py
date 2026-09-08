@@ -10,7 +10,7 @@ from typing import Protocol
 import requests
 
 from .config import Credentials
-from .models import Account, Asset, Bar, Clock, Dividend, Fill, Mover, NewsItem, Order, Position, Quote
+from .models import Account, Asset, Bar, Clock, Dividend, Fill, MinuteBar, Mover, NewsItem, Order, Position, Quote
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +31,7 @@ class Broker(Protocol):
     def get_order(self, order_id: str) -> Order: ...
     def get_latest_prices(self, symbols: list[str]) -> dict[str, float]: ...
     def get_daily_bars(self, symbols: list[str], start: date, end: date) -> dict[str, list[Bar]]: ...
+    def get_minute_bars(self, symbols: list[str], start: datetime, end: datetime) -> dict[str, list[MinuteBar]]: ...
     def get_equity_history(self, period: str = "1A") -> list[float]: ...
     def get_dividends(self, since: date) -> list[Dividend]: ...
     # day-trading surface
@@ -66,9 +67,10 @@ def _parse_order(raw: dict) -> Order:
 class AlpacaBroker:
     """Thin wrapper over the Alpaca Trading and Market Data REST APIs."""
 
-    def __init__(self, creds: Credentials, session: requests.Session | None = None, timeout: float = 20.0):
+    def __init__(self, creds: Credentials, session: requests.Session | None = None, timeout: float = 20.0, feed: str = "iex"):
         self.creds = creds
         self.timeout = timeout
+        self.feed = feed
         self.session = session or requests.Session()
         self.session.headers.update(
             {
@@ -219,7 +221,7 @@ class AlpacaBroker:
     def get_latest_prices(self, symbols: list[str]) -> dict[str, float]:
         if not symbols:
             return {}
-        raw = self._data("GET", "/v2/stocks/trades/latest", params={"symbols": ",".join(symbols), "feed": "iex"})
+        raw = self._data("GET", "/v2/stocks/trades/latest", params={"symbols": ",".join(symbols), "feed": self.feed})
         trades = raw.get("trades", {})
         prices = {sym.upper(): _f(t.get("p")) for sym, t in trades.items()}
         missing = [s for s in symbols if s not in prices or prices[s] <= 0]
@@ -233,7 +235,7 @@ class AlpacaBroker:
         out: dict[str, Quote] = {}
         for i in range(0, len(symbols), 100):
             chunk = symbols[i : i + 100]
-            raw = self._data("GET", "/v2/stocks/quotes/latest", params={"symbols": ",".join(chunk), "feed": "iex"})
+            raw = self._data("GET", "/v2/stocks/quotes/latest", params={"symbols": ",".join(chunk), "feed": self.feed})
             for sym, q in (raw.get("quotes") or {}).items():
                 out[sym.upper()] = Quote(symbol=sym.upper(), bid=_f(q.get("bp")), ask=_f(q.get("ap")))
         return out
@@ -278,7 +280,7 @@ class AlpacaBroker:
             "end": end.isoformat(),
             "limit": 10000,
             "adjustment": "all",
-            "feed": "iex",
+            "feed": self.feed,
             "sort": "asc",
         }
         while True:
@@ -291,6 +293,7 @@ class AlpacaBroker:
                         high=_f(b.get("h"), _f(b["c"])),
                         low=_f(b.get("l"), _f(b["c"])),
                         volume=_f(b.get("v")),
+                        open=_f(b.get("o"), _f(b["c"])),
                     )
                     for b in bars
                 )
@@ -300,6 +303,39 @@ class AlpacaBroker:
             params["page_token"] = token
         for sym in symbols:
             out[sym].sort(key=lambda b: b.day)
+        return out
+
+    def get_minute_bars(self, symbols: list[str], start: datetime, end: datetime) -> dict[str, list[MinuteBar]]:
+        out: dict[str, list[MinuteBar]] = {s: [] for s in symbols}
+        if not symbols:
+            return out
+        fmt = lambda d: d.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        params = {
+            "symbols": ",".join(symbols),
+            "timeframe": "1Min",
+            "start": fmt(start),
+            "end": fmt(end),
+            "limit": 10000,
+            "adjustment": "raw",
+            "feed": self.feed,
+            "sort": "asc",
+        }
+        while True:
+            raw = self._data("GET", "/v2/stocks/bars", params=params)
+            for sym, bars in (raw.get("bars") or {}).items():
+                out.setdefault(sym.upper(), []).extend(
+                    MinuteBar(
+                        t=datetime.fromisoformat(b["t"].replace("Z", "+00:00")),
+                        o=_f(b["o"]), h=_f(b["h"]), l=_f(b["l"]), c=_f(b["c"]), v=_f(b.get("v")),
+                    )
+                    for b in bars
+                )
+            token = raw.get("next_page_token")
+            if not token:
+                break
+            params["page_token"] = token
+        for sym in symbols:
+            out[sym].sort(key=lambda b: b.t)
         return out
 
     def get_equity_history(self, period: str = "1A") -> list[float]:
@@ -351,6 +387,7 @@ class SimBroker:
         self.brackets: list[dict] = []
         self.clock_timestamp = ""
         self.next_close = ""
+        self.minute_bars: dict[str, list[MinuteBar]] = {}
 
     # helpers for callers
     def set_prices(self, prices: dict[str, float]) -> None:
@@ -477,6 +514,9 @@ class SimBroker:
 
     def get_daily_bars(self, symbols: list[str], start: date, end: date) -> dict[str, list[Bar]]:
         return {s: [b for b in self.bars.get(s, []) if start <= b.day <= end] for s in symbols}
+
+    def get_minute_bars(self, symbols: list[str], start: datetime, end: datetime) -> dict[str, list[MinuteBar]]:
+        return {s: [b for b in self.minute_bars.get(s, []) if start <= b.t < end] for s in symbols}
 
     def get_equity_history(self, period: str = "1A") -> list[float]:
         return list(self.equity_history)

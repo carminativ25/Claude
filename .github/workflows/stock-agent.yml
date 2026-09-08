@@ -2,33 +2,36 @@ name: stock-agent
 
 # Weekday schedule in UTC. 13:30 UTC is 9:30 ET during daylight time; in
 # winter (EST) every time below is one hour early relative to the market.
-# Scheduled workflows can also start late. Use cron on a real machine for
-# anything you rely on; this is a convenient way to try the cycle.
+# Scheduled workflows can start late and jobs are capped at 6 hours, so this
+# is fine for a PAPER test and not the right tool for real money.
 on:
   schedule:
-    - cron: "45 12 * * 1-5"        # plan     (~8:45 ET)
-    - cron: "36 13 * * 1-5"        # open     (~9:36 ET)
-    - cron: "*/15 14-19 * * 1-5"   # monitor  (10:00-19:45 UTC)
-    - cron: "52 19 * * 1-5"        # close    (~15:52 ET)
+    - cron: "45 12 * * 1-5"   # plan   (~8:45 ET)
+    - cron: "28 13 * * 1-5"   # trade  (session loop from ~9:28 ET)
+    - cron: "52 19 * * 1-5"   # close  (~15:52 ET)
   workflow_dispatch:
     inputs:
       command:
-        description: "plan | open | monitor | close | review | check"
+        description: "plan | trade | monitor | close | review | check"
         type: choice
         default: plan
-        options: [plan, open, monitor, close, review, check]
+        options: [plan, trade, monitor, close, review, check]
       execute:
-        description: "Submit orders (paper account). Leave false for a dry run."
+        description: "Submit orders on the PAPER account. Leave false for a dry run."
         type: boolean
         default: false
 
 permissions:
   contents: read
 
+env:
+  # Flip to "true" to let the scheduled runs trade on the paper account.
+  EXECUTE: "false"
+
 jobs:
   agent:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 350
     defaults:
       run:
         working-directory: stock-agent
@@ -54,12 +57,11 @@ jobs:
           fi
           case "${{ github.event.schedule }}" in
             "45 12 * * 1-5") cmd=plan ;;
-            "36 13 * * 1-5") cmd=open ;;
-            "52 19 * * 1-5") cmd=close ;;
-            *) cmd=monitor ;;
+            "28 13 * * 1-5") cmd=trade ;;
+            *) cmd=close ;;
           esac
           echo "cmd=$cmd" >> "$GITHUB_OUTPUT"
-          echo "exec=false" >> "$GITHUB_OUTPUT"   # change to true to trade on the paper account
+          echo "exec=${EXECUTE}" >> "$GITHUB_OUTPUT"
       - name: Restore journal
         uses: actions/cache@v4
         with:
@@ -69,11 +71,10 @@ jobs:
       - name: Run
         run: |
           CMD="${{ steps.pick.outputs.cmd }}"
-          if [ "${{ steps.pick.outputs.exec }}" = "true" ] && [ "$CMD" != "plan" ] && [ "$CMD" != "review" ] && [ "$CMD" != "check" ]; then
-            python -m stock_agent "$CMD" --execute
-          else
-            python -m stock_agent "$CMD"
-          fi
+          FLAGS=""
+          [ "$CMD" = "trade" ] && FLAGS="--loop"
+          case "$CMD" in plan|review|check) ;; *) [ "${{ steps.pick.outputs.exec }}" = "true" ] && FLAGS="$FLAGS --execute" ;; esac
+          python -m stock_agent "$CMD" $FLAGS
       - name: Upload journal
         if: always()
         uses: actions/upload-artifact@v4

@@ -74,6 +74,19 @@ class DayTradeConfig:
     analyst_effort: str = "high"
     blocklist: tuple[str, ...] = ()
     journal_dir: str = "journal"
+    # --- opening range breakout entry ---
+    max_watchlist: int = 8                # symbols watched for a breakout each day
+    range_minutes: int = 15               # opening range length
+    entry_window_minutes: int = 90        # no new entries after 9:30 + this
+    min_relative_volume: float = 2.0      # volume so far vs. pro-rata average day
+    min_range_pct: float = 0.3            # ignore ranges narrower than this
+    reward_risk: float = 2.0              # target = entry + reward_risk * (entry - stop)
+    require_vwap_confirmation: bool = True
+    min_gap_pct: float = 2.0              # backtest watchlist: open vs. previous close
+    poll_seconds: int = 60                # live loop interval
+    data_feed: str = "iex"                # iex (free) or sip (paid Alpaca data plan)
+    slippage_bps: float = 5.0             # backtest fill penalty per side, basis points
+    universe: tuple[str, ...] = ()        # backtest universe; empty = built-in default list
 
 
 @dataclass(frozen=True)
@@ -109,9 +122,16 @@ def _build(dc: type, raw: dict[str, Any] | None, section: str):
 
 def _parse_daytrade(raw: dict[str, Any] | None) -> DayTradeConfig:
     raw = dict(raw or {})
-    if "blocklist" in raw:
-        raw["blocklist"] = tuple(str(x).upper() for x in (raw["blocklist"] or []))
+    for key in ("blocklist", "universe"):
+        if key in raw:
+            raw[key] = tuple(str(x).upper() for x in (raw[key] or []))
     dt = _build(DayTradeConfig, raw, "daytrade")
+    if dt.range_minutes < 1 or dt.entry_window_minutes <= dt.range_minutes:
+        raise ConfigError("daytrade.entry_window_minutes must be longer than range_minutes")
+    if dt.reward_risk < 1.0:
+        raise ConfigError("daytrade.reward_risk must be at least 1.0")
+    if dt.data_feed not in ("iex", "sip"):
+        raise ConfigError("daytrade.data_feed must be iex or sip")
     if dt.max_picks < 1:
         raise ConfigError("daytrade.max_picks must be at least 1")
     if not 0 < dt.risk_per_trade_pct <= 5:

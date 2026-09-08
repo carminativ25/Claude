@@ -7,26 +7,43 @@
 # Nothing here is financial advice. Paper trade first.
 
 daytrade:
-  max_picks: 3                   # positions opened per day
+  # --- how much to risk ---
+  max_picks: 3                   # positions taken per day
   risk_per_trade_pct: 0.5        # max % of equity lost if a stop is hit (sets share count)
   max_position_pct: 20.0         # max % of equity in one position
   max_daily_loss_pct: 2.0        # flatten everything and stop for the day
+  respect_pdt_rule: true         # under $25k equity: at most 3 day trades per 5 business days
+  allow_short: false             # long only by default
+
+  # --- what is tradeable (pre-market screen) ---
   min_price: 5.0                 # ignore penny stocks ...
   max_price: 1000.0              # ... and very expensive ones (whole-share sizing)
   min_avg_dollar_volume: 20000000  # 20-day average $ traded per day; keeps you in liquid names
   max_spread_pct: 0.3            # skip anything with a bid/ask spread wider than this
-  min_stop_pct: 0.75             # stop distance bounds; the analyst's stop is clamped into this range
-  max_stop_pct: 4.0
-  min_reward_risk: 1.5           # target must be at least this multiple of the stop
-  allow_short: false             # long only by default
-  entry_delay_minutes: 5         # schedule 'open' this long after 9:30 ET
-  flatten_minutes_before_close: 10
+  min_gap_pct: 2.0               # a stock is "in play" if it opens at least this far from the prior close
   news_lookback_hours: 18        # headlines since yesterday afternoon
   screener_top: 25               # top gainers / losers / most-active to consider
-  respect_pdt_rule: true         # under $25k equity: at most 3 day trades per 5 business days
-  analyst_model: claude-opus-5   # Claude model used to write the morning game plan
-  analyst_effort: high           # low | medium | high | xhigh | max
+  max_watchlist: 8               # names watched for a breakout each day
   blocklist: []                  # symbols never to trade, e.g. [TSLA, GME]
+
+  # --- opening range breakout entry (the same rules run live and in the backtest) ---
+  range_minutes: 15              # opening range = high/low of the first 15 minutes
+  entry_window_minutes: 90       # no new entries after 11:00 ET
+  min_relative_volume: 2.0       # volume so far must be 2x a pro-rata average day
+  require_vwap_confirmation: true  # long breakouts only above VWAP (shorts only below)
+  min_range_pct: 0.3             # ignore ranges narrower than this (noise)
+  min_stop_pct: 0.75             # widen the stop to at least this if the range is tiny
+  max_stop_pct: 4.0              # skip the stock if the range (= stop distance) is wider than this
+  reward_risk: 2.0               # target = entry + 2 x (entry - stop)
+  flatten_minutes_before_close: 10
+  poll_seconds: 60               # `trade --loop` polling interval
+
+  # --- data & analyst ---
+  data_feed: iex                 # iex is free but shows only IEX volume; sip needs a paid Alpaca data plan
+  analyst_model: claude-opus-5   # Claude model that ranks the watchlist from the news
+  analyst_effort: high           # low | medium | high | xhigh | max
+  slippage_bps: 5                # backtest: fill penalty per side, in basis points
+  universe: []                   # backtest universe; empty = built-in list of ~80 liquid names
   journal_dir: journal
 
 # ---------------------------------------------------------------------------

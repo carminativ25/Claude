@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 
 
 @dataclass(frozen=True)
@@ -106,6 +106,17 @@ class Bar:
     high: float = 0.0
     low: float = 0.0
     volume: float = 0.0
+    open: float = 0.0
+
+
+@dataclass(frozen=True)
+class MinuteBar:
+    t: datetime          # bar start, timezone-aware
+    o: float
+    h: float
+    l: float
+    c: float
+    v: float
 
 
 @dataclass(frozen=True)

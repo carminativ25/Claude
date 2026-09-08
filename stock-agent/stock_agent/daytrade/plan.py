@@ -28,17 +28,13 @@ class Candidate:
 
 @dataclass
 class Pick:
+    """A watchlist entry. Entries, stops and targets come from price action, not from here."""
+
     symbol: str
     direction: str               # long | short
     catalyst: str
     thesis: str
     confidence: float            # 0..1
-    stop_pct: float              # distance from entry to stop, in %
-    target_pct: float            # distance from entry to target, in %
-
-    @property
-    def reward_risk(self) -> float:
-        return self.target_pct / self.stop_pct if self.stop_pct > 0 else 0.0
 
 
 @dataclass
@@ -69,11 +65,9 @@ class GamePlan:
     def summary(self) -> str:
         lines = [f"game plan for {self.day} ({self.analyst})", self.market_summary.strip(), ""]
         if not self.picks:
-            lines.append("no trades today")
+            lines.append("empty watchlist: nothing to trade today")
         for p in self.picks:
-            lines.append(
-                f"{p.direction.upper():5} {p.symbol:6} conf {p.confidence:.2f}  stop -{p.stop_pct:.2f}%  target +{p.target_pct:.2f}%  (R:R {p.reward_risk:.1f})"
-            )
+            lines.append(f"{p.direction.upper():5} {p.symbol:6} conf {p.confidence:.2f}")
             lines.append(f"      catalyst: {p.catalyst}")
             lines.append(f"      thesis:   {p.thesis}")
         for r in self.rejected:
@@ -82,7 +76,7 @@ class GamePlan:
 
 
 def validate_picks(cfg: Config, picks: list[Pick], candidates: dict[str, Candidate]) -> tuple[list[Pick], list[dict]]:
-    """Clamp stops/targets to the configured bounds and drop picks that break the rules."""
+    """Keep only rule-abiding watchlist entries, best confidence first, up to max_watchlist."""
     dt = cfg.daytrade
     ok: list[Pick] = []
     rejected: list[dict] = []
@@ -107,11 +101,8 @@ def validate_picks(cfg: Config, picks: list[Pick], candidates: dict[str, Candida
         if not 0 <= p.confidence <= 1:
             rejected.append({"symbol": sym, "reason": "confidence must be between 0 and 1"})
             continue
-        stop = round(min(max(p.stop_pct, dt.min_stop_pct), dt.max_stop_pct), 2)
-        floor_target = math.ceil(stop * dt.min_reward_risk * 100) / 100  # never rounds below the R:R floor
-        target = max(round(p.target_pct, 2), floor_target)
-        ok.append(Pick(sym, p.direction, p.catalyst, p.thesis, p.confidence, stop, target))
-        if len(ok) >= dt.max_picks:
+        ok.append(Pick(sym, p.direction, p.catalyst, p.thesis, p.confidence))
+        if len(ok) >= dt.max_watchlist:
             break
     return ok, rejected
 
@@ -127,13 +118,11 @@ class Sized:
     risk_dollars: float
 
 
-def size_position(cfg: Config, pick: Pick, entry: float, equity: float, cash: float) -> Sized | None:
-    """Shares to buy so that a stop-out loses at most risk_per_trade_pct of equity."""
+def size_position(cfg: Config, symbol: str, side: str, entry: float, stop: float, target: float, equity: float, cash: float) -> Sized | None:
+    """Shares so that a stop-out loses at most risk_per_trade_pct of equity, within the position and cash caps."""
     dt = cfg.daytrade
-    if entry <= 0 or equity <= 0:
-        return None
-    stop_dist = entry * pick.stop_pct / 100.0
-    if stop_dist <= 0:
+    stop_dist = abs(entry - stop)
+    if entry <= 0 or equity <= 0 or stop_dist <= 0:
         return None
     risk_budget = equity * dt.risk_per_trade_pct / 100.0
     by_risk = risk_budget / stop_dist
@@ -142,13 +131,7 @@ def size_position(cfg: Config, pick: Pick, entry: float, equity: float, cash: fl
     qty = int(math.floor(min(by_risk, by_weight, by_cash)))
     if qty < 1:
         return None
-    if pick.direction == "long":
-        stop, target = entry - stop_dist, entry + entry * pick.target_pct / 100.0
-        side = "buy"
-    else:
-        stop, target = entry + stop_dist, entry - entry * pick.target_pct / 100.0
-        side = "sell"
-    return Sized(pick.symbol, side, qty, round(entry, 2), round(stop, 2), round(target, 2), round(qty * stop_dist, 2))
+    return Sized(symbol, side, qty, round(entry, 2), round(stop, 2), round(target, 2), round(qty * stop_dist, 2))
 
 
 def plan_path(cfg: Config, day: date | str) -> Path:

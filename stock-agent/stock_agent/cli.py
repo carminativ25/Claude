@@ -1,6 +1,6 @@
 """Command line interface.
 
-Day trading (default workflow):   plan, open, monitor, close, review, check
+Day trading (default workflow):   plan, trade, monitor, close, review, backtest, check
 Long-term ETF portfolio:          portfolio run|status|income|backtest
 """
 
@@ -18,7 +18,9 @@ from .broker import AlpacaBroker, BrokerError
 from .config import ConfigError, Credentials, has_anthropic_credentials, load_config, load_credentials
 from .daytrade import journal
 from .daytrade.analyst import default_analyst
-from .daytrade.session import close_day, monitor, open_day, plan_day
+from .daytrade.backtest import DEFAULT_UNIVERSE, run_intraday_backtest
+from .daytrade.orb import session_close, session_open
+from .daytrade.session import close_day, monitor, plan_day, trade_loop, trade_once
 from .reporting import income_report, status_report
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "config.yaml"
@@ -33,7 +35,8 @@ def _broker(args) -> tuple[Credentials, AlpacaBroker]:
         )
     if creds.live and not want_live:
         creds = Credentials(api_key=creds.api_key, secret_key=creds.secret_key, live=False, alert_webhook_url=creds.alert_webhook_url)
-    return creds, AlpacaBroker(creds)
+    cfg = load_config(args.config)
+    return creds, AlpacaBroker(creds, feed=cfg.daytrade.data_feed)
 
 
 def _finish(creds: Credentials, report, always_alert: bool) -> int:
@@ -57,11 +60,65 @@ def cmd_plan(args) -> int:
     return _finish(creds, report, always_alert=True)
 
 
-def cmd_open(args) -> int:
+def cmd_trade(args) -> int:
     cfg = load_config(args.config)
     creds, broker = _broker(args)
-    report = open_day(cfg, broker, dry_run=not args.execute, live=creds.live)
-    return _finish(creds, report, always_alert=args.execute)
+    if args.loop:
+        def show(rep):
+            print(rep.summary(), flush=True)
+            if rep.orders or rep.halted_reason:
+                send_alert(creds.alert_webhook_url, f"stock-agent\n{rep.summary()}")
+        reports = trade_loop(cfg, broker, dry_run=not args.execute, live=creds.live, on_report=show)
+        print(f"loop finished after {len(reports)} pass(es)")
+        return 0
+    report = trade_once(cfg, broker, dry_run=not args.execute, live=creds.live)
+    return _finish(creds, report, always_alert=bool(report.orders))
+
+
+def cmd_backtest(args) -> int:
+    import json
+    from datetime import datetime, timedelta
+
+    from .models import MinuteBar
+
+    cfg = load_config(args.config)
+    _, broker = _broker(args)
+    start = date.fromisoformat(args.start)
+    end = date.fromisoformat(args.end) if args.end else date.today() - timedelta(days=1)
+    universe = list(cfg.daytrade.universe or DEFAULT_UNIVERSE)
+    print(f"loading daily bars for {len(universe)} symbols...", flush=True)
+    daily = broker.get_daily_bars(universe, start - timedelta(days=45), end)
+    cache_dir = Path(args.cache)
+
+    def fetch_minutes(symbols, day):
+        out, missing = {}, []
+        for sym in symbols:
+            f = cache_dir / sym / f"{day}.json"
+            if f.exists():
+                out[sym] = [MinuteBar(datetime.fromisoformat(b[0]), *b[1:]) for b in json.loads(f.read_text())]
+            else:
+                missing.append(sym)
+        if missing:
+            fetched = broker.get_minute_bars(missing, session_open(day), session_close(day))
+            for sym in missing:
+                bars = fetched.get(sym, [])
+                out[sym] = bars
+                f = cache_dir / sym / f"{day}.json"
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text(json.dumps([[b.t.isoformat(), b.o, b.h, b.l, b.c, b.v] for b in bars]))
+        return out
+
+    def progress(day, watch, trades):
+        pnl = sum(t.pnl for t in trades)
+        print(f"{day}  watched {', '.join(s for s, _ in watch):60.60}  trades {len(trades)}  P&L {pnl:+,.2f}", flush=True)
+
+    result = run_intraday_backtest(cfg, daily, fetch_minutes, start, end, progress=progress if args.verbose_days else None)
+    print()
+    print(result.summary())
+    if args.trades:
+        result.write_trades(args.trades)
+        print(f"trades written to {args.trades}")
+    return 0
 
 
 def cmd_monitor(args) -> int:
@@ -161,9 +218,18 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--no-claude", action="store_true", help="use the rules-based analyst even if Claude is configured")
     plan.set_defaults(func=cmd_plan)
 
-    opn = sub.add_parser("open", help="at the open: size and submit bracket orders from the game plan")
-    opn.add_argument("--execute", action="store_true", help="actually submit orders (default is a dry run)")
-    opn.set_defaults(func=cmd_open)
+    tr = sub.add_parser("trade", help="watch for opening range breakouts and enter with bracket orders")
+    tr.add_argument("--execute", action="store_true", help="actually submit orders (default is a dry run)")
+    tr.add_argument("--loop", action="store_true", help="keep polling until the close instead of a single pass")
+    tr.set_defaults(func=cmd_trade)
+
+    bt = sub.add_parser("backtest", help="replay the breakout rules on historical minute bars")
+    bt.add_argument("--start", required=True, help="YYYY-MM-DD")
+    bt.add_argument("--end", help="YYYY-MM-DD (default: yesterday)")
+    bt.add_argument("--trades", help="write every simulated trade to this CSV")
+    bt.add_argument("--cache", default="cache/minute", help="directory for cached minute bars")
+    bt.add_argument("--verbose-days", action="store_true", help="print one line per trading day")
+    bt.set_defaults(func=cmd_backtest)
 
     mon = sub.add_parser("monitor", help="intraday: enforce the daily loss limit and flatten before the close")
     mon.add_argument("--execute", action="store_true")
@@ -189,11 +255,11 @@ def build_parser() -> argparse.ArgumentParser:
     inc = pfs.add_parser("income", help="dividend income report")
     inc.add_argument("--days", type=int, default=365)
     inc.set_defaults(func=cmd_portfolio_income)
-    bt = pfs.add_parser("backtest", help="backtest the ETF strategy")
-    bt.add_argument("--start", required=True)
-    bt.add_argument("--end")
-    bt.add_argument("--curve")
-    bt.set_defaults(func=cmd_portfolio_backtest)
+    pbt = pfs.add_parser("backtest", help="backtest the ETF strategy")
+    pbt.add_argument("--start", required=True)
+    pbt.add_argument("--end")
+    pbt.add_argument("--curve")
+    pbt.set_defaults(func=cmd_portfolio_backtest)
     return p
 
 

@@ -36,7 +36,7 @@ class Analyst(Protocol):
 # Rules-based fallback
 # ---------------------------------------------------------------------------
 class RulesAnalyst:
-    """Long the strongest news-backed gappers with a volatility-scaled stop."""
+    """Watch the strongest gappers, preferring those with a headline behind the gap."""
 
     name = "rules"
 
@@ -44,26 +44,26 @@ class RulesAnalyst:
         dt = cfg.daytrade
         scored = []
         for c in candidates.values():
-            if not c.headlines or c.gap_pct < 2.0:
+            if abs(c.gap_pct) < dt.min_gap_pct:
                 continue
-            score = min(c.gap_pct, 15.0) / 15.0 * 0.6 + min(len(c.headlines), 3) / 3.0 * 0.4
+            score = min(abs(c.gap_pct), 15.0) / 15.0 * 0.6 + min(len(c.headlines), 3) / 3.0 * 0.4
             scored.append((score, c))
         scored.sort(key=lambda t: -t[0])
         picks = []
-        for score, c in scored[: dt.max_picks]:
-            stop = min(max(c.atr_pct * 0.75, dt.min_stop_pct), dt.max_stop_pct)
+        for score, c in scored[: dt.max_watchlist]:
+            direction = "long" if c.gap_pct > 0 or not dt.allow_short else "short"
+            if c.gap_pct < 0 and not dt.allow_short:
+                continue
             picks.append(
                 Pick(
                     symbol=c.symbol,
-                    direction="long",
-                    catalyst=c.headlines[0],
-                    thesis=f"gapping {c.gap_pct:+.1f}% on news with ${c.avg_dollar_volume/1e6:.0f}M average daily volume",
+                    direction=direction,
+                    catalyst=c.headlines[0] if c.headlines else "gap without a headline",
+                    thesis=f"gapping {c.gap_pct:+.1f}% with ${c.avg_dollar_volume/1e6:.0f}M average daily volume; trade only on a range breakout",
                     confidence=round(0.4 + 0.4 * score, 2),
-                    stop_pct=round(stop, 2),
-                    target_pct=round(stop * 2.0, 2),
                 )
             )
-        summary = f"rules analyst: {len(candidates)} liquid candidates, {len(scored)} gapping on news"
+        summary = f"rules analyst: {len(candidates)} liquid candidates, {len(scored)} gapping at least {dt.min_gap_pct}%"
         return GamePlan(day=day.isoformat(), market_summary=summary, picks=picks, analyst=self.name)
 
 
@@ -83,11 +83,9 @@ PLAN_SCHEMA = {
                     "direction": {"type": "string", "enum": ["long", "short"]},
                     "catalyst": {"type": "string", "description": "The specific news event driving the trade."},
                     "thesis": {"type": "string", "description": "Why the stock should move further today, and what would prove the idea wrong."},
-                    "confidence": {"type": "number", "description": "0 to 1"},
-                    "stop_pct": {"type": "number", "description": "Stop distance from entry in percent."},
-                    "target_pct": {"type": "number", "description": "Target distance from entry in percent."},
+                    "confidence": {"type": "number", "description": "0 to 1: how likely today's move is to continue rather than fade."},
                 },
-                "required": ["symbol", "direction", "catalyst", "thesis", "confidence", "stop_pct", "target_pct"],
+                "required": ["symbol", "direction", "catalyst", "thesis", "confidence"],
                 "additionalProperties": False,
             },
         },
@@ -107,22 +105,23 @@ PLAN_SCHEMA = {
 
 SYSTEM_PROMPT = """You are the pre-market analyst for a small, rules-bound intraday trading desk.
 
-Each morning you receive overnight headlines and a screened list of liquid US stocks with their gap, volatility and volume statistics. Your job is to pick the few names, if any, whose news gives a real reason to expect continued movement during today's session, and to say clearly why.
+Each morning you receive overnight headlines and a screened list of liquid US stocks with their gap, volatility and volume statistics. Your job is to build the day's watchlist: the few names, if any, where the news gives a real reason for today's move to continue rather than fade, and to say clearly why.
 
-How the desk works, so your plan fits it:
-- Entries are market orders a few minutes after the open. Every position has a stop-loss and a take-profit attached, and everything is closed before the bell. There is no overnight risk.
-- Position size is computed by the desk from your stop distance, so the stop must be where the idea is wrong, not an arbitrary number. Targets must be at least the configured reward-to-risk multiple of the stop.
-- Only symbols from the candidate list can be traded. Anything else is ignored.
-- Not trading is a valid and common answer. A day with no clear catalysts should return an empty picks list.
+How the desk works, so your watchlist fits it:
+- You do not trigger trades. The desk waits for the opening range to form and only enters a watchlist name if price breaks out of that range on unusually high volume. Stops, targets and position size are all computed from the range. Everything is closed before the bell.
+- Only symbols from the candidate list can be watched. Anything else is ignored.
+- Use "direction" to say which way a breakout would be worth taking. Shorts are only used if the desk allows them.
+- An empty watchlist is a valid and common answer. A day with no clear catalysts should return no picks.
 
-Prefer catalysts that are new, specific and company-level: earnings beats or misses with guidance changes, FDA decisions, contract wins, M&A, analyst upgrades on real news. Treat generic market commentary, stale news, and already-exhausted moves as reasons to avoid. Be sceptical of small stocks with huge gaps and thin volume. Keep each thesis to two or three sentences and include what would invalidate it."""
+Prefer catalysts that are new, specific and company-level: earnings with guidance changes, FDA decisions, contract wins, M&A, analyst moves on real news. Flag reasons a gap is likely to fade: dilutive offerings, lockup expiries, stale news, moves already exhausted overnight, small stocks with huge gaps and thin volume. Keep each thesis to two or three sentences."""
 
 
 def build_user_prompt(cfg: Config, day: date, candidates: dict[str, Candidate], news: list[NewsItem]) -> str:
     dt = cfg.daytrade
     lines = [f"Trading day: {day.isoformat()}", ""]
-    lines.append(f"Desk limits: at most {dt.max_picks} positions; stop between {dt.min_stop_pct}% and {dt.max_stop_pct}%; "
-                 f"target at least {dt.min_reward_risk}x the stop; shorting {'allowed' if dt.allow_short else 'NOT allowed'}.")
+    lines.append(f"Desk limits: watchlist of at most {dt.max_watchlist} names, at most {dt.max_picks} positions taken; "
+                 f"entries only on a {dt.range_minutes}-minute opening range breakout with relative volume above {dt.min_relative_volume}x; "
+                 f"shorting {'allowed' if dt.allow_short else 'NOT allowed'}.")
     lines.append("")
     lines.append("## Overnight headlines (newest first)")
     for n in news[:50]:
@@ -136,7 +135,7 @@ def build_user_prompt(cfg: Config, day: date, candidates: dict[str, Candidate], 
         heads = " || ".join(c.headlines[:3]) if c.headlines else "-"
         lines.append(f"{c.symbol} | {c.source} | {c.price:.2f} | {c.gap_pct:+.2f}% | ${c.avg_dollar_volume/1e6:.0f}M | {c.atr_pct:.2f}% | {heads}")
     lines.append("")
-    lines.append("Return the game plan as JSON matching the schema. Use only candidate symbols.")
+    lines.append("Return the watchlist as JSON matching the schema. Use only candidate symbols.")
     return "\n".join(lines)
 
 
@@ -204,8 +203,6 @@ class ClaudeAnalyst:
                         catalyst=str(raw["catalyst"]),
                         thesis=str(raw["thesis"]),
                         confidence=float(raw["confidence"]),
-                        stop_pct=float(raw["stop_pct"]),
-                        target_pct=float(raw["target_pct"]),
                     )
                 )
             except (KeyError, TypeError, ValueError) as exc:
