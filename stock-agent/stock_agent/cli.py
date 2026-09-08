@@ -21,6 +21,7 @@ from .daytrade.analyst import default_analyst
 from .daytrade.backtest import DEFAULT_UNIVERSE, run_intraday_backtest
 from .daytrade.orb import session_close, session_open
 from .daytrade.session import close_day, monitor, plan_day, trade_loop, trade_once
+from .daytrade.snapshot import snapshot
 from .reporting import income_report, status_report
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "config.yaml"
@@ -135,6 +136,15 @@ def cmd_close(args) -> int:
     return _finish(creds, report, always_alert=args.execute)
 
 
+def cmd_snapshot(args) -> int:
+    cfg = load_config(args.config, args.overrides)
+    _, broker = _broker(args)
+    for sym in args.symbols:
+        print(snapshot(cfg, broker, sym))
+        print()
+    return 0
+
+
 def cmd_review(args) -> int:
     cfg = load_config(args.config, args.overrides)
     stats, rows = journal.review(cfg)
@@ -240,6 +250,10 @@ def build_parser() -> argparse.ArgumentParser:
     cls = sub.add_parser("close", help="flatten every position and cancel open orders")
     cls.add_argument("--execute", action="store_true")
     cls.set_defaults(func=cmd_close)
+
+    snap = sub.add_parser("snapshot", help="intraday read on one or more symbols: range, VWAP, relative volume, volume trend")
+    snap.add_argument("symbols", nargs="+", metavar="SYMBOL")
+    snap.set_defaults(func=cmd_snapshot)
 
     rev = sub.add_parser("review", help="performance statistics from the journal")
     rev.add_argument("--trades", action="store_true", help="list every trade")

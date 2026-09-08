@@ -385,3 +385,18 @@ def test_trade_loop_polls_then_flattens(tmp_path):
     assert [r.command for r in reports] == ["trade", "monitor"]
     assert len(broker.brackets) == 1 and broker.get_positions() == []
     assert slept == [1]
+
+
+def test_snapshot_reads_session(tmp_path):
+    from stock_agent.daytrade.snapshot import snapshot
+
+    cfg = dcfg(tmp_path)
+    broker = market_broker()
+    bars = acme_session(breakout=True)
+    broker.minute_bars = {"ACME": bars}
+    now = session_open(TODAY) + timedelta(minutes=60)
+    broker.clock_timestamp = now.isoformat()
+    text = snapshot(cfg, broker, "acme", today=TODAY, now=now)
+    assert "ACME" in text and "opening range 51.50-52.50" in text and "price is above" in text
+    assert "VWAP" in text and "x a normal day's pace" in text and "read:" in text
+    assert "not enough daily history" in snapshot(cfg, broker, "ZZZZ", today=TODAY, now=now)
