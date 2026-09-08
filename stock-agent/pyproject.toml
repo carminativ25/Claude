@@ -3,7 +3,7 @@ name = "stock-agent"
 version = "0.1.0"
 description = "News-driven day trading agent (with a long-term ETF mode) on the Alpaca API"
 requires-python = ">=3.10"
-dependencies = ["requests>=2.31", "PyYAML>=6.0", "anthropic>=1.4"]
+dependencies = ["requests>=2.31", "PyYAML>=6.0", "anthropic>=1.4", "tzdata>=2024.1"]
 
 [project.scripts]
 stock-agent = "stock_agent.cli:main"
