@@ -40,6 +40,24 @@ backtest, and it runs on an Alpaca paper account by default.
 
 ## Setup
 
+**Windows (Command Prompt).** Install Python from
+https://www.python.org/downloads/windows/ and tick "Add python.exe to PATH"
+in the installer. Then:
+
+```
+cd Claude\stock-agent
+windows\setup.cmd
+notepad .env            (paste the Alpaca PAPER keys, and an Anthropic key if you have one)
+windows\agent.cmd check
+```
+
+Every command in this README that starts with `python -m stock_agent` can
+be run on Windows as `windows\agent.cmd` followed by the same arguments,
+for example `windows\agent.cmd backtest --start 2026-03-01`. The script
+loads the keys from `.env` for you.
+
+**macOS / Linux.**
+
 ```bash
 cd stock-agent
 python3 -m venv .venv && source .venv/bin/activate
@@ -104,7 +122,21 @@ month on paper and compare `review` with the backtest. If they disagree
 badly, slippage or the news filter is the difference, and both are worth
 knowing before real money.
 
-### cron
+### Windows Task Scheduler
+
+Create three tasks (weekdays), each with "Start in" set to the `stock-agent`
+folder and the program set to the full path of `windows\agent.cmd`:
+
+| Time (ET) | Arguments |
+|-----------|-----------|
+| 8:45 | `plan` |
+| 9:29 | `trade --loop --execute` |
+| 15:52 | `close --execute` |
+
+The script reads the keys from `.env`, so no environment variables are
+needed. Tick "Run whether user is logged on or not" if the PC will be locked.
+
+### cron (macOS / Linux)
 
 ```
 45 8  * * 1-5  cd /path/to/stock-agent && . .env && python -m stock_agent plan >> logs/agent.log 2>&1
