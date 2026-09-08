@@ -394,6 +394,7 @@ def test_snapshot_reads_session(tmp_path):
     broker = market_broker()
     bars = acme_session(breakout=True)
     broker.minute_bars = {"ACME": bars}
+    broker.quotes["ACME"] = Quote("ACME", 52.80, 52.85)  # trading above the 51.5-52.5 range
     now = session_open(TODAY) + timedelta(minutes=60)
     broker.clock_timestamp = now.isoformat()
     text = snapshot(cfg, broker, "acme", today=TODAY, now=now)
