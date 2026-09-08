@@ -262,6 +262,10 @@ def build_parser() -> argparse.ArgumentParser:
     pbt.add_argument("--end")
     pbt.add_argument("--curve")
     pbt.set_defaults(func=cmd_portfolio_backtest)
+
+    # Accept --set after the subcommand too (argparse otherwise only allows it before it).
+    for subparser in list(sub.choices.values()) + list(pfs.choices.values()):
+        subparser.add_argument("--set", dest="overrides", action="append", metavar="SECTION.KEY=VALUE", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     return p
 
 
