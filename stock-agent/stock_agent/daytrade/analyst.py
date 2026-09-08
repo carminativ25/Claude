@@ -46,6 +46,8 @@ class RulesAnalyst:
         for c in candidates.values():
             if abs(c.gap_pct) < dt.min_gap_pct:
                 continue
+            if dt.min_gap_atr > 0 and (c.atr_pct <= 0 or abs(c.gap_pct) < dt.min_gap_atr * c.atr_pct):
+                continue
             score = min(abs(c.gap_pct), 15.0) / 15.0 * 0.6 + min(len(c.headlines), 3) / 3.0 * 0.4
             scored.append((score, c))
         scored.sort(key=lambda t: -t[0])

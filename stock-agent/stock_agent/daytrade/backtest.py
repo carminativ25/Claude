@@ -150,6 +150,11 @@ def build_watchlist(cfg: Config, day: date, daily: dict[str, list[Bar]]) -> tupl
         gap = (today_bar.open - prev.close) / prev.close * 100.0
         if abs(gap) < dt.min_gap_pct or sym in dt.blocklist:
             continue
+        if dt.min_gap_atr > 0:
+            trs = [max(b.high - b.low, abs(b.high - pb.close), abs(b.low - pb.close)) for pb, b in zip(hist[-15:-1], hist[-14:])]
+            atr_pct = sum(trs) / len(trs) / prev.close * 100.0 if trs and prev.close else 0.0
+            if atr_pct <= 0 or abs(gap) < dt.min_gap_atr * atr_pct:
+                continue
         if gap < 0 and not dt.allow_short:
             continue
         avg_vol[sym] = sum(b.volume for b in hist) / len(hist)
@@ -292,7 +297,10 @@ def simulate_day(cfg: Config, day: date, watch: list[tuple[str, str]], minutes: 
     traded = {t.symbol for t in trades}
     for sym, _ in watch:
         if sym not in traded and bars[sym]:
-            diag.reasons[last_reason.get(sym, "no breakout")] += 1
+            reason = last_reason.get(sym, "no breakout")
+            if reason == "range forming" and len(traded) >= dt.max_picks:
+                reason = "no free position slot"
+            diag.reasons[reason] += 1
     return trades, halted
 
 

@@ -35,7 +35,7 @@ def _broker(args) -> tuple[Credentials, AlpacaBroker]:
         )
     if creds.live and not want_live:
         creds = Credentials(api_key=creds.api_key, secret_key=creds.secret_key, live=False, alert_webhook_url=creds.alert_webhook_url)
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, args.overrides)
     return creds, AlpacaBroker(creds, feed=cfg.daytrade.data_feed)
 
 
@@ -51,7 +51,7 @@ def _finish(creds: Credentials, report, always_alert: bool) -> int:
 # day trading commands
 # ---------------------------------------------------------------------------
 def cmd_plan(args) -> int:
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, args.overrides)
     creds, broker = _broker(args)
     use_claude = not args.no_claude and has_anthropic_credentials()
     if not use_claude and not args.no_claude:
@@ -61,7 +61,7 @@ def cmd_plan(args) -> int:
 
 
 def cmd_trade(args) -> int:
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, args.overrides)
     creds, broker = _broker(args)
     if args.loop:
         def show(rep):
@@ -81,7 +81,7 @@ def cmd_backtest(args) -> int:
 
     from .models import MinuteBar
 
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, args.overrides)
     _, broker = _broker(args)
     start = date.fromisoformat(args.start)
     end = date.fromisoformat(args.end) if args.end else date.today() - timedelta(days=1)
@@ -122,21 +122,21 @@ def cmd_backtest(args) -> int:
 
 
 def cmd_monitor(args) -> int:
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, args.overrides)
     creds, broker = _broker(args)
     report = monitor(cfg, broker, dry_run=not args.execute, live=creds.live)
     return _finish(creds, report, always_alert=bool(report.orders))
 
 
 def cmd_close(args) -> int:
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, args.overrides)
     creds, broker = _broker(args)
     report = close_day(cfg, broker, dry_run=not args.execute, live=creds.live)
     return _finish(creds, report, always_alert=args.execute)
 
 
 def cmd_review(args) -> int:
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, args.overrides)
     stats, rows = journal.review(cfg)
     if args.trades:
         print("\n".join(rows))
@@ -146,7 +146,7 @@ def cmd_review(args) -> int:
 
 
 def cmd_check(args) -> int:
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, args.overrides)
     dt = cfg.daytrade
     print(f"config OK: day trading up to {dt.max_picks} picks, {dt.risk_per_trade_pct}% risk/trade, {dt.max_daily_loss_pct}% daily loss limit, analyst {dt.analyst_model}")
     print(f"claude analyst: {'available' if has_anthropic_credentials() else 'NOT configured (rules analyst will be used)'}")
@@ -166,7 +166,7 @@ def cmd_check(args) -> int:
 # long-term portfolio commands
 # ---------------------------------------------------------------------------
 def cmd_portfolio_run(args) -> int:
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, args.overrides)
     creds, broker = _broker(args)
     dry_run = not args.execute
     report = run_once(cfg, broker, dry_run=dry_run, live=creds.live, trade_log=Path(args.trade_log) if args.trade_log else None)
@@ -174,7 +174,7 @@ def cmd_portfolio_run(args) -> int:
 
 
 def cmd_portfolio_status(args) -> int:
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, args.overrides)
     _, broker = _broker(args)
     print(status_report(cfg, broker))
     return 0
@@ -187,7 +187,7 @@ def cmd_portfolio_income(args) -> int:
 
 
 def cmd_portfolio_backtest(args) -> int:
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, args.overrides)
     _, broker = _broker(args)
     start = date.fromisoformat(args.start)
     end = date.fromisoformat(args.end) if args.end else date.today() - timedelta(days=1)
@@ -210,6 +210,8 @@ def cmd_portfolio_backtest(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="stock-agent", description="News-driven day trading agent on Alpaca (paper by default)")
     p.add_argument("--config", default=str(DEFAULT_CONFIG), help="path to config.yaml")
+    p.add_argument("--set", dest="overrides", action="append", metavar="SECTION.KEY=VALUE",
+                   help="override a config value for this run, e.g. --set daytrade.reward_risk=1.5 (repeatable)")
     p.add_argument("--live", action="store_true", help="use the live account (also needs STOCK_AGENT_LIVE_TRADING)")
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="command", required=True)

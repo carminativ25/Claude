@@ -58,3 +58,14 @@ def test_risk_off_weight_must_fit_position_cap():
 def test_single_target_above_cap_rejected():
     with pytest.raises(ConfigError, match="exceed risk.max_position_weight"):
         make_config(targets={"VTI": 0.97}, regime={"enabled": False})
+
+
+def test_overrides_apply_and_coerce(tmp_path):
+    from stock_agent.cli import DEFAULT_CONFIG
+
+    cfg = load_config(DEFAULT_CONFIG, ["daytrade.reward_risk=1.5", "daytrade.allow_short=true", "daytrade.blocklist=[TSLA]"])
+    assert cfg.daytrade.reward_risk == 1.5 and cfg.daytrade.allow_short is True and cfg.daytrade.blocklist == ("TSLA",)
+    with pytest.raises(ConfigError, match="section.key"):
+        load_config(DEFAULT_CONFIG, ["reward_risk=1"])
+    with pytest.raises(ConfigError, match="Unknown keys"):
+        load_config(DEFAULT_CONFIG, ["daytrade.nope=1"])

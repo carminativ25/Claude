@@ -82,7 +82,8 @@ class DayTradeConfig:
     min_range_pct: float = 0.3            # ignore ranges narrower than this
     reward_risk: float = 2.0              # target = entry + reward_risk * (entry - stop)
     require_vwap_confirmation: bool = True
-    min_gap_pct: float = 2.0              # backtest watchlist: open vs. previous close
+    min_gap_pct: float = 2.0              # watchlist: open vs. previous close, in percent
+    min_gap_atr: float = 0.0              # watchlist: gap must also be at least this many daily ATRs (0 = off)
     poll_seconds: int = 60                # live loop interval
     data_feed: str = "iex"                # iex (free) or sip (paid Alpaca data plan)
     slippage_bps: float = 5.0             # backtest fill penalty per side, basis points
@@ -211,7 +212,25 @@ def parse_config(raw: dict[str, Any]) -> Config:
     return Config(targets=targets, trading=trading, regime=regime, risk=risk, backtest=backtest, daytrade=daytrade)
 
 
-def load_config(path: str | Path) -> Config:
+def apply_overrides(raw: dict[str, Any], overrides: list[str] | None) -> dict[str, Any]:
+    """Apply command-line overrides like 'daytrade.reward_risk=1.5' to the raw config mapping."""
+    for item in overrides or []:
+        if "=" not in item:
+            raise ConfigError(f"override must look like section.key=value, got {item!r}")
+        dotted, value = item.split("=", 1)
+        parts = dotted.strip().split(".")
+        if len(parts) < 2:
+            raise ConfigError(f"override key must be section.key, got {dotted!r}")
+        node = raw
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+            if not isinstance(node, dict):
+                raise ConfigError(f"cannot override inside non-mapping {dotted!r}")
+        node[parts[-1]] = yaml.safe_load(value)
+    return raw
+
+
+def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
     path = Path(path)
     if not path.exists():
         raise ConfigError(f"Config file not found: {path}")
@@ -219,7 +238,7 @@ def load_config(path: str | Path) -> Config:
         raw = yaml.safe_load(fh) or {}
     if not isinstance(raw, dict):
         raise ConfigError("Config file must contain a YAML mapping")
-    return parse_config(raw)
+    return parse_config(apply_overrides(raw, overrides))
 
 
 @dataclass(frozen=True)

@@ -200,3 +200,10 @@ def test_backtest_reports_why_nothing_traded():
     assert res.trades == []
     assert res.reasons["low relative volume"] == 1
     assert res.rvol_at_breakout and "low relative volume" in res.summary()
+
+
+def test_min_gap_atr_filters_normal_volatility():
+    # 4% gap on a stock whose daily range is ~2%: passes at 1.5 ATR, fails at 3 ATR
+    d = daily({"AAA": 4.0})
+    assert build_watchlist(cfg(min_gap_atr=1.5), DAY, d)[0] == [("AAA", "long")]
+    assert build_watchlist(cfg(min_gap_atr=3.0), DAY, d)[0] == []
